@@ -2,7 +2,7 @@
   "name": "codex-console",
   "displayName": "Codex Console",
   "description": "Antigravity side-pane visual console (MCP App) for local Codex CLI, Desktop, and Worktree tasks: live progress streaming, read-only blocker diagnosis, codex queue wakeup, cross-session bindings, and send-back-to-chat.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "logo": "assets/logo.svg",
   "homepage": "https://github.com/Koala973/antigravity-lead-codex",
   "repository": "https://github.com/Koala973/antigravity-lead-codex",

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Koala973/antigravity-lead-codex/releases"><img src="https://img.shields.io/badge/release-v1.0.0-7c3aed.svg" alt="Release v1.0.0"/></a>
+  <a href="https://github.com/Koala973/antigravity-lead-codex/releases"><img src="https://img.shields.io/badge/release-v1.0.1-7c3aed.svg" alt="Release v1.0.1"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"/></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20(WSL2)-lightgrey.svg" alt="Platform"/>
   <img src="https://img.shields.io/badge/node-%3E%3D22.5-339933.svg" alt="Node 22.5+"/>
@@ -26,13 +26,15 @@
 ---
 
 <p align="center">
-  <img src="img/preview-console.svg" alt="Codex Console Preview" width="100%"/>
+  <img src="img/showcase-live.jpg" alt="Antigravity + Codex Console 实机全景效果" width="100%"/>
+  <br/>
+  <sub>全景协同视图：左栏 Antigravity 主控对话 · 右栏 Codex Console 侧栏（像素紫猫、实时额度环与软隐藏抽屉）</sub>
 </p>
 
 <p align="center">
-  <img src="img/showcase-live.jpg" alt="Antigravity + Codex Console 实机全景效果" width="100%"/>
+  <img src="img/showcase-subagents.jpg" alt="Codex Console 子代理双栏审计视图" width="100%"/>
   <br/>
-  <sub>实机全景效果：左栏 Antigravity 主控对话 · 右栏 Codex Console 侧栏插件（含像素紫猫、实时额度环与软隐藏抽屉）</sub>
+  <sub>子代理统一双栏视图：隔离 Worktree 执行摘要、自测验收状态、可一键打开的改动文件清单与像素紫猫「喵~」互动</sub>
 </p>
 
 ## 简介

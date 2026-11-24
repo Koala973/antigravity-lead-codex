@@ -59,6 +59,8 @@ const state = {
 
   catMeowing: false,
   catMeowTimer: null,
+  catFreezeLeft: null,
+  catFreezeFlip: 1,
   lastCatWakeMs: 0,
 
   modal: null,                 // null | spawn | readonly | binding | rename
@@ -1069,7 +1071,13 @@ function render() {
             </button>
           </nav>
           <div class="topbar-right">
-            ${renderPixelCat({ mode: cat.mode, label: cat.label, meowing: state.catMeowing })}
+            ${renderPixelCat({
+              mode: cat.mode,
+              label: cat.label,
+              meowing: state.catMeowing,
+              freezeLeft: state.catFreezeLeft,
+              freezeFlip: state.catFreezeFlip,
+            })}
             ${renderQuotaWidget()}
             <button class="icon-btn tip-trigger tip-bottom-right" id="btnRefresh" data-tip="立即刷新任务、进度与实时额度">${state.loadingSnapshot ? '·' : '↻'}</button>
             <button class="icon-btn accent tip-trigger tip-bottom-right" id="btnOpenSpawn" data-tip="新建受管 Codex 子代理（隔离 Worktree）">+</button>
@@ -1117,13 +1125,30 @@ function bindEvents() {
     refreshQuotaLive();
   });
 
-  // Pixel cat click: stops & pops '喵~', wakes from sleep, and jumps to active/blocked task if any
-  document.getElementById('btnCatPet')?.addEventListener('click', () => {
+  // Pixel cat click: freezes at its exact live runway position, hops in place & pops '喵~'
+  document.getElementById('btnCatPet')?.addEventListener('click', (e) => {
+    const btn = e.currentTarget;
+    const walker = btn?.querySelector('.cat-walker');
+    const svg = btn?.querySelector('.cat-svg');
+    if (walker) {
+      const curLeft = parseFloat(window.getComputedStyle(walker).left);
+      if (!Number.isNaN(curLeft)) state.catFreezeLeft = curLeft;
+    }
+    if (svg) {
+      const tf = window.getComputedStyle(svg).transform;
+      // Matrix(a, b, c, d, tx, ty): negative 'a' means scaleX(-1)
+      if (tf && tf.startsWith('matrix(')) {
+        const a = parseFloat(tf.slice(7).split(',')[0]);
+        if (!Number.isNaN(a)) state.catFreezeFlip = a < 0 ? -1 : 1;
+      }
+    }
+
     state.catMeowing = true;
     state.lastCatWakeMs = Date.now();
     if (state.catMeowTimer) clearTimeout(state.catMeowTimer);
     state.catMeowTimer = setTimeout(() => {
       state.catMeowing = false;
+      state.catFreezeLeft = null;
       render();
     }, 2200);
 

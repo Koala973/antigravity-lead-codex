@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Koala973/antigravity-lead-codex/releases"><img src="https://img.shields.io/badge/release-v1.0.0-7c3aed.svg" alt="Release v1.0.0"/></a>
+  <a href="https://github.com/Koala973/antigravity-lead-codex/releases"><img src="https://img.shields.io/badge/release-v1.0.1-7c3aed.svg" alt="Release v1.0.1"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"/></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20(WSL2)-lightgrey.svg" alt="Platform"/>
   <img src="https://img.shields.io/badge/node-%3E%3D22.5-339933.svg" alt="Node 22.5+"/>
@@ -26,13 +26,15 @@
 ---
 
 <p align="center">
-  <img src="img/preview-console.svg" alt="Codex Console Preview" width="100%"/>
+  <img src="img/showcase-live.jpg" alt="Antigravity + Codex Console Live Full-Window Showcase" width="100%"/>
+  <br/>
+  <sub>Full-window showcase: Antigravity Brain chat on the left · Codex Console MCP App side pane on the right</sub>
 </p>
 
 <p align="center">
-  <img src="img/showcase-live.jpg" alt="Antigravity + Codex Console Live Full-Window Showcase" width="100%"/>
+  <img src="img/showcase-subagents.jpg" alt="Codex Console Subagents Unified Dual-Pane View" width="100%"/>
   <br/>
-  <sub>Live full-window showcase: Antigravity Brain chat on the left · Codex Console MCP App side pane on the right</sub>
+  <sub>Subagents dual-pane audit view: isolated Worktree summary, test verification status, clickable changed files &amp; interactive pixel purple cat</sub>
 </p>
 
 ## Overview

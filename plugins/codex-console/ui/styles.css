@@ -356,26 +356,25 @@ html, body, #root {
   animation: cat-alert 1.1s ease-in-out infinite;
 }
 
-/* Meowing (clicked!): stops in place, cute happy hop + 喵~ bubble */
+/* Meowing (clicked!): freezes at exact current left position, cute in-place hop + 喵~ bubble */
 .cat-runway.mode-meowing .cat-walker {
-  left: 22px;
   animation: cat-meow-hop 0.45s ease-out;
 }
 
 .cat-meow {
   position: absolute;
-  top: -17px;
+  top: -13px;
   left: 50%;
   transform: translateX(-50%);
-  padding: 1px 6px;
+  padding: 0.5px 5px;
   border-radius: 999px;
   background: var(--violet-grad);
   color: #ffffff;
-  font-size: 9.5px;
+  font-size: 8.5px;
   font-weight: 700;
-  line-height: 1.4;
+  line-height: 1.35;
   white-space: nowrap;
-  box-shadow: 0 3px 10px rgba(124, 58, 237, 0.35);
+  box-shadow: 0 2px 8px rgba(124, 58, 237, 0.35);
   animation: meow-pop 0.25s cubic-bezier(0.2, 1.4, 0.4, 1);
   pointer-events: none;
 }

@@ -10,7 +10,13 @@
  *  - 'meowing'   : triggered on click — stops, opens tiny mouth, pops '喵~' bubble
  */
 
-export function renderPixelCat({ mode = 'sleeping', label = '', meowing = false }) {
+export function renderPixelCat({
+  mode = 'sleeping',
+  label = '',
+  meowing = false,
+  freezeLeft = null,
+  freezeFlip = 1,
+}) {
   const effectiveMode = meowing
     ? 'meowing'
     : ['working', 'strolling', 'blocked', 'sleeping'].includes(mode)
@@ -18,6 +24,14 @@ export function renderPixelCat({ mode = 'sleeping', label = '', meowing = false 
       : 'sleeping';
 
   const eyesOpen = effectiveMode !== 'sleeping';
+  const walkerStyle =
+    meowing && typeof freezeLeft === 'number'
+      ? `style="left:${freezeLeft.toFixed(1)}px"`
+      : '';
+  const svgStyle =
+    meowing && (freezeFlip === -1 || freezeFlip === 1)
+      ? `style="transform:scaleX(${freezeFlip})"`
+      : '';
 
   const eyesSvg = eyesOpen
     ? `
@@ -52,9 +66,9 @@ export function renderPixelCat({ mode = 'sleeping', label = '', meowing = false 
       data-tip="${label}"
       aria-label="${label}"
     >
-      <span class="cat-walker">
+      <span class="cat-walker" ${walkerStyle}>
         ${overlay}
-        <svg class="cat-svg" viewBox="0 0 14 11" width="23" height="18" shape-rendering="crispEdges" aria-hidden="true">
+        <svg class="cat-svg" ${svgStyle} viewBox="0 0 14 11" width="23" height="18" shape-rendering="crispEdges" aria-hidden="true">
           <rect x="2" y="0" width="2" height="2" fill="#8b7be8"/>
           <rect x="10" y="0" width="2" height="2" fill="#8b7be8"/>
           <rect x="2" y="0" width="1" height="1" fill="#b4a7fa"/>

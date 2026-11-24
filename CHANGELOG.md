@@ -2,6 +2,12 @@
 
 All notable changes to **antigravity-lead-codex** will be documented in this file.
 
+## [1.0.1] - 2026-11-25
+
+### Improved / 优化
+- **Pixel Purple Cat In-Place Meow / 像素紫猫原地停步喵叫**：点击右上角像素紫猫时改为捕获当前实时跑道坐标与朝向原地停步跳跃并冒出 `喵~`，消除回到默认位置的生硬瞬移。
+- **Unified Dual-Pane Showcase / 双图实机展示升级**：README 升级为双 2× Retina 零马赛克展示图（`任务` 全景视图 + `子代理` 统一双栏审计视图）。
+
 ## [1.0.0] - 2026-11-24
 
 ### Added
