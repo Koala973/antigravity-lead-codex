@@ -28,13 +28,13 @@
 <p align="center">
   <img src="img/showcase-live.jpg" alt="Antigravity + Codex Console 实机全景效果" width="100%"/>
   <br/>
-  <sub>全景协同视图：左栏 Antigravity 主控对话 · 右栏 Codex Console 侧栏（像素紫猫、实时额度环与软隐藏抽屉）</sub>
+  <sub>全景协同视图：左栏 Antigravity 主控对话 · 右栏 Codex 侧栏</sub>
 </p>
 
 <p align="center">
   <img src="img/showcase-subagents.jpg" alt="Codex Console 子代理双栏审计视图" width="100%"/>
   <br/>
-  <sub>子代理统一双栏视图：隔离 Worktree 执行摘要、自测验收状态、可一键打开的改动文件清单与像素紫猫「喵~」互动</sub>
+  <sub>子代理统一双栏视图：隔离 Worktree 执行摘要、自测验收状态、可一键打开的改动文件清单与猫猫「喵~」互动</sub>
 </p>
 
 ## 简介
