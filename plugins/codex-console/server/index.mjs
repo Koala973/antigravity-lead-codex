@@ -311,6 +311,7 @@ server.registerTool(
       difficulty: z.enum(['auto', 'low', 'medium', 'hard', 'extreme']).optional(),
       quality: z.enum(['smart', 'max', 'balanced']).optional(),
       isolation: z.enum(['worktree', 'inplace', 'auto']).optional(),
+      network: z.boolean().optional().describe('是否开启 workspace-write 联网权限（--network，仅在用户确认联网/外部CLI任务后设为 true）'),
       changeKey: z.string().optional().describe('可选 OpenSpec Change / Goal 标识，用于跨会话绑定'),
       goalTitle: z.string().optional().describe('可选 Goal 标题'),
     },
@@ -320,7 +321,7 @@ server.registerTool(
     try {
       const op = runner.spawnWorker(args);
       return ok(
-        `已启动受管 Codex 子代理任务（操作ID: ${op.id}，目录: ${args.cwd}，策略: ${args.quality || 'smart'}/${args.difficulty || 'auto'}/${args.isolation || 'worktree'}）。`,
+        `已启动受管 Codex 子代理任务（操作ID: ${op.id}，目录: ${args.cwd}，策略: ${args.quality || 'smart'}/${args.difficulty || 'auto'}/${args.isolation || 'worktree'}${args.network ? '/network' : ''}）。`,
         { op }
       );
     } catch (err) {

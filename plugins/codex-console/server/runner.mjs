@@ -380,6 +380,7 @@ export class CodexRunner {
     difficulty = 'auto',
     quality = 'smart',
     isolation = 'worktree',
+    network = false,
     changeKey = '',
     goalTitle = '',
   }) {
@@ -395,12 +396,13 @@ export class CodexRunner {
       throw new Error(`未找到多端调度脚本: ${DISPATCH_SCRIPT}`);
     }
 
+    const useNetwork = Boolean(network);
     const op = this.consoleDb.createOp({
       threadId: null,
       opType: 'spawn_worker',
       prompt: cleanPrompt,
-      mode: `${quality}/${difficulty}/${isolation}`,
-      meta: { cwd: cleanCwd, taskId: taskId || null, changeKey: changeKey || null },
+      mode: `${quality}/${difficulty}/${isolation}${useNetwork ? '/net' : ''}`,
+      meta: { cwd: cleanCwd, taskId: taskId || null, changeKey: changeKey || null, network: useNetwork },
     });
 
     const args = [
@@ -417,6 +419,9 @@ export class CodexRunner {
       '--prompt',
       cleanPrompt,
     ];
+    if (useNetwork) {
+      args.push('--network');
+    }
     if (taskId && taskId.trim()) {
       args.push('--task-id', taskId.trim());
     }

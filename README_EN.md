@@ -19,7 +19,8 @@
 <p align="center">
   <a href="README.md">🇨🇳 中文文档</a> |
   <a href="docs/ARCHITECTURE.md">📐 Architecture</a> |
-  <a href="docs/DOCTOR.md">🩺 Doctor & FAQ</a> |
+  <a href="docs/CAPABILITIES.md">🧰 Capabilities &amp; Gates</a> |
+  <a href="docs/DOCTOR.md">🩺 Doctor &amp; FAQ</a> |
   <a href="CHANGELOG.md">📝 Changelog</a>
 </p>
 
@@ -51,8 +52,22 @@ When orchestrating local **OpenAI Codex CLI** workers from **Google Antigravity*
   - **Send Back to Chat**: Push diagnostic results, latest Codex replies, or worker audit summaries directly back to the active Antigravity conversation via `app.sendMessage()`.
   - **Multi-Mode Dispatch**: Send instructions via `codex queue --resume`, `codex exec resume`, or `dispatch.py resume`, guarded by 60-second duplicate-send protection.
   - **Cross-Session Collaboration Ledger (SQLite)**: Persist `Change / Goal ↔ Codex Thread ID` ownership bindings so any new Antigravity window can immediately inspect who owns what via MCP.
-- **Codex Auto Router (`plugins/codex-auto-router`)**: Brain ↔ Hand collaboration policy (`rules/AGENTS.md`) plus a fail-safe `PreToolUse` human merge-gate hook for `agy-worker/*` branches.
-- **Multi-Agent Dispatch (`skills/multi-agent-dispatch`)**: Zero-dependency Python 3.10+ Git Worktree dispatcher with dynamic frontier model discovery from `~/.codex/models_cache.json` and `--quality smart|max|balanced` routing.
+- **Codex Auto Router (`plugins/codex-auto-router`)**: Brain ↔ Hand collaboration policy (`rules/AGENTS.md`) with an **Explicit Dispatch Pre-Flight Gate** (<= 3 read-only checks, zero silent takeover), **3-tier Scenario Routing Matrix**, **4 Mandatory Confirmation Gates**, plus a fail-safe `PreToolUse` hook (`allow_dispatch.py`) gating both `--network` dispatches and `agy-worker/*` branch merges with `force_ask`.
+- **Multi-Agent Dispatch (`skills/multi-agent-dispatch`)**: Zero-dependency Python 3.10+ Git Worktree dispatcher with dynamic frontier model discovery from `~/.codex/models_cache.json`, `--quality smart|max|balanced` routing, and an opt-in `--network` flag (`sandbox_workspace_write.network_access=true` while preserving filesystem isolation outside the workdir).
+
+---
+
+## Capability Matrix & Extending the Hand
+
+Headless `codex exec` is **not limited to code edits**—it inherits MCP servers (`codex mcp add`), official plugins/connectors (`codex plugin add`), local `~/.codex/skills/`, built-in web search, and image generation:
+
+| Tier | Execution Path | Best-Fit Scenarios | Confirmation Gate |
+| :--- | :--- | :--- | :--- |
+| **Tier 1 (Default Offline)** | `dispatch.py run` (`workspace-write`, offline + Git worktree) | Multi-file coding, refactoring, tests, local scripts, repo review, local Office/PDF workflows (`documents`/`spreadsheets`/`presentations`/`pdf` plugins & skills), native web search & image gen | Present 3–6 line plan (waived only for safe local tasks with explicit `"run directly"` / `"直接执行"`) |
+| **Tier 2 (Networked & MCP-Extended)** | `dispatch.py run --network` / `codex mcp add` / `codex plugin add` | Outbound HTTPS & authenticated CLIs (`gh`, cloud/SaaS CLIs, package installs, Keychain-backed CLIs); headless browser automation (`chrome-devtools-mcp --headless --isolated` or `@playwright/mcp`); SaaS connectors (GitHub, Figma, Gmail, Linear, Slack, Drive) | **Always confirm** before `--network` or any external mutation (hook enforces `force_ask`) |
+| **Tier 3 (Brain or Codex Desktop)** | Antigravity directly / Interactive Codex Desktop | `/grill-me`, architecture design, <=20-line edits, Blackboard & audits, live already-logged-in Chrome tabs (without dedicated CDP port), Desktop GUI (`cua_repl` requires Codex Desktop IPC) | On explicit Codex dispatch requests, stop within <=3 read-only checks and present Option A vs Option B |
+
+See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for verified extension recipes and all four confirmation gates.
 
 ---
 

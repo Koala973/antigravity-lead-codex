@@ -758,22 +758,24 @@ def build_worker_prompt(
     user_prompt: str,
     *,
     sandbox: str,
+    network: bool = False,
     is_resume: bool = False,
     files_hint: list[str] | None = None,
 ) -> str:
     scope_line = f"- Priority files/paths: {', '.join(files_hint)}\n" if files_hint else ""
+    net_note = " (network_access=true; keep external actions strictly scoped)" if network else ""
     if is_resume:
         return (
             f"{user_prompt.strip()}\n\n"
             "[Execution Contract]\n"
-            f"- Sandbox: {sandbox}. Do not merge or switch outside this worktree.\n"
+            f"- Sandbox: {sandbox}{net_note}. Do not merge or switch outside this worktree.\n"
             f"{scope_line}"
             "- Run the relevant verification checks/tests before finishing and report exact outcomes concisely.\n"
         )
     return (
         f"{user_prompt.strip()}\n\n"
         "[Execution Contract]\n"
-        f"- Sandbox: {sandbox}. Keep changes scoped to this task and never auto-merge.\n"
+        f"- Sandbox: {sandbox}{net_note}. Keep changes scoped to this task and never auto-merge.\n"
         f"{scope_line}"
         "- Before finishing, run appropriate verification (tests/lint/build/typecheck) and summarize facts concisely.\n"
     )
@@ -900,9 +902,12 @@ def build_codex_exec_cmd(
     model: str | None,
     effort: str | None,
     sandbox: str,
+    network: bool = False,
     report_path: Path,
     is_git_repo: bool,
 ) -> list[str]:
+    if network and sandbox != "workspace-write":
+        raise ValueError("--network requires --sandbox workspace-write.")
     cmd = [
         codex_bin,
         "exec",
@@ -916,6 +921,10 @@ def build_codex_exec_cmd(
     cmd.extend([
         "-s",
         sandbox,
+    ])
+    if network:
+        cmd.extend(["-c", "sandbox_workspace_write.network_access=true"])
+    cmd.extend([
         "-c",
         'approval_policy="never"',
         "--json",
@@ -937,9 +946,12 @@ def build_codex_resume_cmd(
     model: str | None,
     effort: str | None,
     sandbox: str,
+    network: bool = False,
     report_path: Path,
     is_git_repo: bool,
 ) -> list[str]:
+    if network and sandbox != "workspace-write":
+        raise ValueError("--network requires --sandbox workspace-write.")
     # codex exec resume does NOT accept -s/--sandbox or -C/--cd; use -c sandbox_mode and subprocess cwd.
     cmd = [
         codex_bin,
@@ -953,6 +965,10 @@ def build_codex_resume_cmd(
     cmd.extend([
         "-c",
         f'sandbox_mode="{sandbox}"',
+    ])
+    if network:
+        cmd.extend(["-c", "sandbox_workspace_write.network_access=true"])
+    cmd.extend([
         "-c",
         'approval_policy="never"',
         "--json",
@@ -1004,6 +1020,7 @@ def execute_single_task(
     alternate: bool | None,
     prefer_wide: bool,
     sandbox: str,
+    network: bool = False,
     isolation: str,
     timeout: int,
     files_hint: list[str] | None,
@@ -1012,6 +1029,8 @@ def execute_single_task(
 ) -> dict[str, Any]:
     if not cwd.exists() or not cwd.is_dir():
         raise ValueError(f"Target cwd does not exist or is not a directory: {cwd}")
+    if network and sandbox != "workspace-write":
+        raise ValueError("--network requires --sandbox workspace-write.")
 
     git_info = inspect_git(cwd)
     eff_isolation, isolation_reason = resolve_isolation(isolation, sandbox, git_info)
@@ -1038,7 +1057,7 @@ def execute_single_task(
 
     run_dir = RUNS_DIR / tid
     report_path = run_dir / "last_message.json"
-    worker_prompt = build_worker_prompt(prompt, sandbox=sandbox, is_resume=False, files_hint=files_hint)
+    worker_prompt = build_worker_prompt(prompt, sandbox=sandbox, network=network, is_resume=False, files_hint=files_hint)
 
     if dry_run:
         preview_workdir = (
@@ -1052,6 +1071,7 @@ def execute_single_task(
             model=model_used,
             effort=effort_used,
             sandbox=sandbox,
+            network=network,
             report_path=report_path,
             is_git_repo=git_info["is_git_repo"],
         )
@@ -1063,6 +1083,7 @@ def execute_single_task(
             "isolation": eff_isolation,
             "isolation_reason": isolation_reason,
             "sandbox": sandbox,
+            "network": network,
             "git": git_info,
             "preview_workdir": str(preview_workdir),
             "command": preview_cmd,
@@ -1086,6 +1107,7 @@ def execute_single_task(
         model=model_used,
         effort=effort_used,
         sandbox=sandbox,
+        network=network,
         report_path=report_path,
         is_git_repo=git_info["is_git_repo"],
     )
@@ -1124,6 +1146,7 @@ def execute_single_task(
         "branch": branch_name,
         "isolation": eff_isolation,
         "sandbox": sandbox,
+        "network": network,
         "session_id": session_id,
         "status": final_status,
         "exit_code": rc,
@@ -1144,6 +1167,7 @@ def execute_single_task(
         "isolation": eff_isolation,
         "isolation_reason": isolation_reason,
         "sandbox": sandbox,
+        "network": network,
         "workdir": str(workdir),
         "branch": branch_name,
         "session_id": session_id,
@@ -1213,6 +1237,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         alternate=args.alternate,
         prefer_wide=args.prefer_wide,
         sandbox=args.sandbox,
+        network=args.network,
         isolation=args.isolation,
         timeout=args.timeout,
         files_hint=args.files,
@@ -1243,6 +1268,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
         item_alt = item.get("alternate")
         if item_alt is None and "no_alternate" in item:
             item_alt = not bool(item["no_alternate"])
+        item_network = bool(item.get("network", args.network))
         res = execute_single_task(
             prompt=item["prompt"],
             cwd=item_cwd,
@@ -1254,6 +1280,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
             alternate=item_alt,
             prefer_wide=bool(item.get("prefer_wide", False)),
             sandbox=item_sandbox,
+            network=item_network,
             isolation=item_iso,
             timeout=int(item.get("timeout", args.timeout)),
             files_hint=item.get("files"),
@@ -1300,6 +1327,9 @@ def cmd_resume(args: argparse.Namespace) -> int:
         raise ValueError(f"Workdir does not exist: {workdir}")
 
     sandbox = args.sandbox or (task_record["sandbox"] if task_record else "workspace-write")
+    network = args.network if args.network is not None else bool(task_record.get("network", False) if task_record else False)
+    if network and sandbox != "workspace-write":
+        raise ValueError("--network requires --sandbox workspace-write.")
     base_sha = task_record.get("base_sha") if task_record else None
     git_info = inspect_git(workdir)
 
@@ -1346,7 +1376,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     turn_id = make_task_id("turn")
     run_dir = RUNS_DIR / resume_tid / turn_id
     report_path = run_dir / "last_message.json"
-    worker_prompt = build_worker_prompt(prompt_text, sandbox=sandbox, is_resume=True)
+    worker_prompt = build_worker_prompt(prompt_text, sandbox=sandbox, network=network, is_resume=True)
 
     if args.dry_run:
         preview_cmd = build_codex_resume_cmd(
@@ -1355,6 +1385,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
             model=model_used,
             effort=effort_used,
             sandbox=sandbox,
+            network=network,
             report_path=report_path,
             is_git_repo=git_info["is_git_repo"],
         )
@@ -1366,6 +1397,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
                     "backend": backend,
                     "session_id": session_id,
                     "workdir": str(workdir),
+                    "network": network,
                     "routing": routing,
                     "command": preview_cmd,
                 },
@@ -1384,6 +1416,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         model=model_used,
         effort=effort_used,
         sandbox=sandbox,
+        network=network,
         report_path=report_path,
         is_git_repo=git_info["is_git_repo"],
     )
@@ -1409,6 +1442,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
             if resume_tid in state["tasks"]:
                 state["tasks"][resume_tid]["model"] = model_used
                 state["tasks"][resume_tid]["effort"] = effort_used
+                state["tasks"][resume_tid]["sandbox"] = sandbox
+                state["tasks"][resume_tid]["network"] = network
                 state["tasks"][resume_tid]["session_id"] = new_session_id
                 state["tasks"][resume_tid]["status"] = (
                     "timed_out" if timed_out else report.get("status", "completed" if rc == 0 else "failed")
@@ -1422,6 +1457,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
         "model_used": model_used,
         "effort_used": effort_used,
         "routing": routing,
+        "sandbox": sandbox,
+        "network": network,
         "workdir": str(workdir),
         "session_id": new_session_id,
         "exit_code": rc,
@@ -1660,6 +1697,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--alternate", dest="alternate", action="store_true", default=None, help="Enable alternation across flagship/wide_fast on medium.")
     p_run.add_argument("--no-alternate", dest="alternate", action="store_false", help="Disable alternation on medium.")
     p_run.add_argument("--sandbox", choices=VALID_SANDBOXES, default="workspace-write")
+    p_run.add_argument("--network", action="store_true", help="Enable sandbox_workspace_write.network_access=true while preserving filesystem sandbox outside workdir.")
     p_run.add_argument("--isolation", choices=VALID_ISOLATIONS, default="auto")
     p_run.add_argument("--timeout", type=int, default=600)
     p_run.add_argument("--files", nargs="*", default=None, help="Optional target file hints.")
@@ -1670,6 +1708,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument("--manifest", required=True, help="Path to JSON list or {tasks:[...]} file.")
     p_batch.add_argument("--cwd", default=None, help="Default cwd when task item omits cwd.")
     p_batch.add_argument("--quality", choices=VALID_QUALITIES, default="smart")
+    p_batch.add_argument("--network", action="store_true", help="Default network_access=true for batch tasks (overridable per item).")
     p_batch.add_argument("--max-concurrency", type=int, default=3)
     p_batch.add_argument("--timeout", type=int, default=600)
     p_batch.add_argument("--dry-run", action="store_true")
@@ -1688,6 +1727,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_res.add_argument("--alternate", dest="alternate", action="store_true", default=None)
     p_res.add_argument("--no-alternate", dest="alternate", action="store_false")
     p_res.add_argument("--sandbox", choices=VALID_SANDBOXES, default=None)
+    p_res.add_argument("--network", dest="network", action="store_true", default=None, help="Enable workspace-write network access on resume.")
+    p_res.add_argument("--no-network", dest="network", action="store_false", help="Disable workspace-write network access on resume.")
     p_res.add_argument("--timeout", type=int, default=600)
     p_res.add_argument("--dry-run", action="store_true")
 

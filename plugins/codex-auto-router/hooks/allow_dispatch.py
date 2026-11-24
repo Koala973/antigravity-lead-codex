@@ -38,6 +38,7 @@ FORBIDDEN_FRAGMENTS = (
     "--dangerously-bypass-approvals-and-sandbox",
     "danger-full-access",
 )
+NETWORK_FLAGS = frozenset({"--network"})
 WORKER_MERGE_RE = re.compile(r"\bgit\b.*\b(?:merge|cherry-pick)\b.*agy-worker/")
 
 
@@ -81,26 +82,42 @@ def has_unsafe_shell_syntax(cmd: str) -> bool:
     return in_single or in_double or escaped
 
 
-def is_pure_dispatch_command(cmd: str) -> bool:
+def _parse_pure_dispatch_argv(cmd: str) -> list[str] | None:
     if not cmd or has_unsafe_shell_syntax(cmd):
-        return False
+        return None
     try:
         argv = shlex.split(cmd, posix=True)
     except ValueError:
-        return False
+        return None
 
     if any(frag in arg for arg in argv for frag in FORBIDDEN_FRAGMENTS):
-        return False
+        return None
 
     if len(argv) >= 3 and argv[0] in ALLOWED_PYTHON_BINS:
         script_candidate = os.path.realpath(os.path.expanduser(argv[1]))
-        return script_candidate == DISPATCH_SCRIPT and argv[2] in ALLOWED_SUBCOMMANDS
+        if script_candidate == DISPATCH_SCRIPT and argv[2] in ALLOWED_SUBCOMMANDS:
+            return argv
 
     if len(argv) >= 2:
         script_candidate = os.path.realpath(os.path.expanduser(argv[0]))
-        return script_candidate == DISPATCH_SCRIPT and argv[1] in ALLOWED_SUBCOMMANDS
+        if script_candidate == DISPATCH_SCRIPT and argv[1] in ALLOWED_SUBCOMMANDS:
+            return argv
 
-    return False
+    return None
+
+
+def _has_network_flag(argv: list[str]) -> bool:
+    return any(
+        arg in NETWORK_FLAGS or arg.startswith("--network=")
+        for arg in argv
+    )
+
+
+def is_pure_dispatch_command(cmd: str) -> bool:
+    argv = _parse_pure_dispatch_argv(cmd)
+    if argv is None:
+        return False
+    return not _has_network_flag(argv)
 
 
 DEFER_TO_STANDARD_APPROVAL = {
@@ -125,10 +142,16 @@ def evaluate_hook(payload: object) -> dict[str, str]:
     if not isinstance(cmd, str) or not cmd.strip():
         return DEFER_TO_STANDARD_APPROVAL
 
-    if is_pure_dispatch_command(cmd):
+    dispatch_argv = _parse_pure_dispatch_argv(cmd)
+    if dispatch_argv is not None:
+        if _has_network_flag(dispatch_argv):
+            return {
+                "decision": "force_ask",
+                "reason": "Human network gate: confirm before granting Codex worker outbound network / authenticated CLI access (--network).",
+            }
         return {
             "decision": "allow",
-            "reason": "Auto-approved sandboxed multi-agent-dispatch CLI call.",
+            "reason": "Auto-approved offline sandboxed multi-agent-dispatch CLI call.",
         }
 
     if WORKER_MERGE_RE.search(cmd):

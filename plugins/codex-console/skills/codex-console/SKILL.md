@@ -17,7 +17,7 @@ description: >-
    - `get_codex_task_detail`: 读取指定 Codex 会话的最近对话、Goal 状态、Git Worktree 变更与控制台历史诊断。
    - `ask_codex_readonly`: 基于 `codex exec fork --ephemeral -c sandbox_mode="read-only"` 执行非侵入式只读提问或一键诊断卡点，不修改工作区文件、不污染原会话上下文。
    - `send_codex_message`: 通过 `codex queue --resume`（排队唤醒）或 `codex exec resume` / `dispatch.py resume` 向目标会话投递指令，内置 60 秒防重投保护。
-   - `spawn_codex_worker`: 调用 `multi-agent-dispatch` 在隔离 Git Worktree 中新建受管子代理，并可选写入跨会话绑定。
+   - `spawn_codex_worker`: 调用 `multi-agent-dispatch` 在隔离 Git Worktree（或非 Git 目录 `inplace`）中新建受管子代理，支持按需开启 `network: true`（`--network`，需先过人工确认门禁）并可选写入跨会话绑定。
    - `manage_collab_binding`: 读写 `${PLUGIN_DATA}/console.sqlite` 中的 `Change / BLACKBOARD 任务 ↔ Codex Thread ID` 绑定表与交接日志，供多个 Antigravity 会话共享上下文。
 
 ## 推荐使用姿势（Brain ↔ Hand 协同）

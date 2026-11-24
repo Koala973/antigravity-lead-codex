@@ -19,6 +19,7 @@
 <p align="center">
   <a href="README_EN.md">🇬🇧 English</a> |
   <a href="docs/ARCHITECTURE.md">📐 架构说明</a> |
+  <a href="docs/CAPABILITIES.md">🧰 适配场景与能力扩展</a> |
   <a href="docs/DOCTOR.md">🩺 诊断与排障</a> |
   <a href="CHANGELOG.md">📝 更新日志</a>
 </p>
@@ -57,11 +58,25 @@
   - **多模式投递与防重投**：支持 `codex queue --resume`（排队唤醒）、`codex exec resume`（同步续跑）、`dispatch.py resume` 及 60 秒防重复投递保护；
   - **跨会话协作台账（SQLite）**：把需求/Change 与 Codex 会话 ID、负责方（`codex` / `antigravity` / `shared`）持久化在插件独立库，新开零重力窗口也能通过 MCP 直接接手上下文。
 - **脑手协作路由规范（`plugins/codex-auto-router`）**
-  - 内置 `Brain ↔ Hand` 协作规则（`rules/AGENTS.md`）与 `docs/BLACKBOARD.md` 黑板同步规范；
-  - 内置失败安全型 `PreToolUse` Hook（`hooks/allow_dispatch.py`），自动放行合规沙箱调度并在合并 `agy-worker/*` 分支前强制人工确认。
+  - 内置 `Brain ↔ Hand` 协作规则（`rules/AGENTS.md`）、**显式派发前置门禁（≤3 步判断、禁止静默越俎代庖）**、**四大必停确认点**与 `docs/BLACKBOARD.md` 黑板同步规范；
+  - 内置失败安全型 `PreToolUse` Hook（`hooks/allow_dispatch.py`），自动放行离线合规沙箱调度，并对 `--network` 联网派发与 `agy-worker/*` 分支合并强制人工确认（`force_ask`）。
 - **隔离 Worktree 调度器（`skills/multi-agent-dispatch`）**
   - 纯 Python 标准库实现（零第三方 pip 依赖），自动读取 `~/.codex/models_cache.json` 动态发现最新官方前沿模型；
-  - 默认 `--quality smart` 权衡质量与额度，按任务隔离创建 Git Worktree，返回紧凑结构化 JSON 报告。
+  - 默认 `--quality smart` 权衡质量与额度，按任务隔离创建 Git Worktree，返回紧凑结构化 JSON 报告；支持显式 `--network` 开关（开启 `sandbox_workspace_write.network_access=true`，同时继续锁死工作目录外的文件写入沙箱，绝不降级到 `danger-full-access`）。
+
+---
+
+## 适配场景、能力扩展与确认门禁
+
+Codex CLI（`codex exec`）**并不局限于写代码**——它原生支持 MCP Server、官方插件/连接器、本地 Skills、内置搜索与生图，并可通过 `--network` 安全打通外部 CLI/API：
+
+| 层级 | 执行通道 | 典型适配场景 | 确认门禁 |
+| :--- | :--- | :--- | :--- |
+| **Tier 1（默认离线）** | `dispatch.py run`（`workspace-write` 离线 + Git Worktree） | 多文件编码/重构/排障/单测、本地脚本、仓库级评审、本地 Office/PDF 生成（`documents`/`spreadsheets`/`presentations`/`pdf` 插件与 `~/.codex/skills/`）；内置 `web__run` 搜索与 `image_gen` 同样可用 | 先出 3–6 行计划确认（仅本地安全任务带「直接执行」可跳过） |
+| **Tier 2（联网与 MCP 扩展）** | `dispatch.py run --network` / `codex mcp add` / `codex plugin add` | 外部 CLI 与 API（`gh`、云/SaaS CLI、包安装、macOS Keychain 鉴权 CLI）；无头浏览器自动化（`codex mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --headless --isolated` 或 Playwright MCP）；云端 SaaS 连接器（GitHub/Figma/Gmail/Linear/Slack/Drive 等） | **强制人工确认**（`--network` 或任何外部系统写操作，哪怕带「直接执行」也必须先确认） |
+| **Tier 3（留在 Brain 或 Codex Desktop）** | Antigravity 直接处理 / 交互式 Codex Desktop | `/grill-me` 需求澄清、架构设计、<=20 行微改、黑板与审计、操作你当前已登录 Chrome 窗口（未配独立 CDP 端口时）、macOS 桌面 GUI（`cua_repl` 依赖 Codex Desktop Electron IPC，无头 `codex exec` 下不可用） | 显式说「派 Codex」时最多做 3 步只读探测，发现阻塞立即停手给 A/B 方案 |
+
+完整能力清单、MCP/插件挂载命令与四道确认门禁说明见 [docs/CAPABILITIES.md](docs/CAPABILITIES.md)。
 
 ---
 

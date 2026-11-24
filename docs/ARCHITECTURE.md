@@ -4,9 +4,11 @@
 
 | Layer | Owner | Responsibilities |
 | :--- | :--- | :--- |
-| **Brain** | Google Antigravity | Requirement alignment (`/grill-me`), architecture design, maintaining `docs/BLACKBOARD.md`, auditing diffs & tests, resolving blockers, human merge decisions |
-| **Hand** | Local Codex CLI (`dispatch.py`) | Multi-file implementation, refactoring, and self-verification inside isolated Git Worktrees (`agy-worker/<task_id>`) |
+| **Brain** | Google Antigravity | Requirement alignment (`/grill-me`), architecture design, maintaining `docs/BLACKBOARD.md`, auditing diffs & tests, enforcing 4 confirmation gates, resolving blockers, human merge decisions |
+| **Hand** | Local Codex CLI (`dispatch.py`) | Multi-file implementation, refactoring, local Office/PDF/skill tasks in offline `workspace-write` worktrees; opt-in networked CLI/API tasks via `--network` (`sandbox_workspace_write.network_access=true` with filesystem isolation intact); extensible via `codex mcp add` (e.g., headless `chrome-devtools-mcp`) and `codex plugin add` |
 | **Control Plane** | `codex-console` MCP App | Real-time side-pane visibility into all Codex CLI / Worktree / Desktop threads, non-destructive read-only diagnosis, queue/resume dispatch, and cross-session Change ↔ Thread SQLite bindings |
+
+For the full capability matrix, MCP/plugin extension recipes, and confirmation gates, see [docs/CAPABILITIES.md](./CAPABILITIES.md).
 
 ---
 
