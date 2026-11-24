@@ -29,6 +29,12 @@
   <img src="img/preview-console.svg" alt="Codex Console Preview" width="100%"/>
 </p>
 
+<p align="center">
+  <img src="img/showcase-live.jpg" alt="Antigravity + Codex Console Live Full-Window Showcase" width="100%"/>
+  <br/>
+  <sub>Live full-window showcase: Antigravity Brain chat on the left · Codex Console MCP App side pane on the right</sub>
+</p>
+
 ## Overview
 
 When orchestrating local **OpenAI Codex CLI** workers from **Google Antigravity** inside isolated Git Worktrees, Codex Desktop hides `source='exec'` threads and unregistered worktree paths. **Antigravity-Lead-Codex** bridges that visibility gap and delivers a complete **Brain ↔ Hand** suite:

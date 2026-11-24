@@ -29,6 +29,12 @@
   <img src="img/preview-console.svg" alt="Codex Console Preview" width="100%"/>
 </p>
 
+<p align="center">
+  <img src="img/showcase-live.jpg" alt="Antigravity + Codex Console 实机全景效果" width="100%"/>
+  <br/>
+  <sub>实机全景效果：左栏 Antigravity 主控对话 · 右栏 Codex Console 侧栏插件（含像素紫猫、实时额度环与软隐藏抽屉）</sub>
+</p>
+
 ## 简介
 
 当你用 **Google Antigravity（Brain）** 调度本地 **OpenAI Codex CLI（Hand）** 在隔离 Git Worktree 中并行编码时，会遇到两个真实痛点：
