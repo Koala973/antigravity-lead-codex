@@ -186,14 +186,6 @@ bash scripts/install.sh --uninstall
 
 ---
 
-## Roadmap
-
-- [ ] 原生 Windows 支持（`dispatch.py` `msvcrt` 文件锁适配 + `install.ps1` / `doctor.ps1` + Windows 宿主实测）
-- [ ] 任务成本与 Token 消耗趋势面板
-- [ ] 一键从控制台直接预览完整 `git diff` 补丁与触发 `dispatch.py cleanup`
-
----
-
 ## License
 
 本项目采用 [MIT License](LICENSE) 开源。
