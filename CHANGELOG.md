@@ -2,6 +2,13 @@
 
 All notable changes to **antigravity-lead-codex** will be documented in this file.
 
+## [1.0.2] - 2026-11-25
+
+### Added / 新增
+- **Explicit Dispatch Gates & 4 Confirmation Checkpoints / 显式派发硬门禁与四大确认点**：更新 `codex-auto-router/rules/AGENTS.md`，在用户显式指派 Codex 时强制限制 Antigravity 最多执行 ≤3 步轻量只读预检，禁止静默越俎代庖；补齐派发计划、联网/外部写操作、阻塞上报、分支合并与远端推送四道确认门禁。
+- **Opt-In `--network` Sandbox Flag / 受控 `--network` 联网沙箱开关**：`dispatch.py`（`run` / `batch` / `resume`）与 `codex-console` `spawn_codex_worker` 支持按需启用 `sandbox_workspace_write.network_access=true`，解锁外网请求与本机鉴权 CLI，同时继续锁死工作目录外文件写入隔离（绝不降级至 `danger-full-access`）；`allow_dispatch.py` Hook 对 `--network` 强制返回 `force_ask`。
+- **Capability Matrix & Hand Extension Guide / 适配场景与扩展手册**：新增 [docs/CAPABILITIES.md](docs/CAPABILITIES.md)，给出三层适配场景矩阵及 `codex mcp add`（如无头 `chrome-devtools-mcp` / Playwright MCP）、`codex plugin add`、`~/.codex/skills/` 实测扩展配方，并补齐单元测试（5/5 通过）。
+
 ## [1.0.1] - 2026-11-25
 
 ### Improved / 优化
