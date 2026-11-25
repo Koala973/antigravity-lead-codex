@@ -204,7 +204,13 @@ function extractTextFromItem(itemType, itemJson) {
 }
 
 function computeEffectiveStatus({ thread, goal, latestTurn, dispatchTask }) {
-  if (latestTurn?.status === 'inProgress') {
+  const dispatchTerminal =
+    dispatchTask &&
+    ['completed', 'failed', 'cleaned', 'cancelled', 'timed_out', 'stopped'].includes(
+      dispatchTask.status
+    );
+
+  if (latestTurn?.status === 'inProgress' && !dispatchTerminal) {
     return { code: 'running', label: '运行中', tone: 'info' };
   }
   if (goal?.status === 'blocked') {
@@ -222,8 +228,19 @@ function computeEffectiveStatus({ thread, goal, latestTurn, dispatchTask }) {
   if (goal?.status === 'complete') {
     return { code: 'complete', label: 'Goal 完成', tone: 'success' };
   }
-  if (latestTurn?.status === 'failed' || dispatchTask?.status === 'failed') {
+  if (
+    (!dispatchTerminal && latestTurn?.status === 'failed') ||
+    dispatchTask?.status === 'failed' ||
+    dispatchTask?.status === 'timed_out'
+  ) {
     return { code: 'failed', label: '执行异常', tone: 'danger' };
+  }
+  if (dispatchTask?.status === 'cleaned') {
+    return {
+      code: 'exec_done',
+      label: dispatchTask.exit_code === 124 ? '已清理(曾超时)' : 'CLI 已清理',
+      tone: 'muted',
+    };
   }
   if (thread.archived) {
     return { code: 'archived', label: '已归档', tone: 'muted' };

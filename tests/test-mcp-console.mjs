@@ -55,6 +55,16 @@ function createSyntheticCodexHome(codexHome, dispatchDir) {
       )`
     )
     .run(nowSec - 900, nowSec - 600, nowMs - 900000, nowMs - 600000);
+  stateDb
+    .prepare(
+      `INSERT INTO threads VALUES (
+        '01a90000-0000-7000-8000-000000000003', '', ?, ?, ?, ?, 'exec', 'user', 'codex_exec',
+        '/tmp/worktrees/acme-api/demo-task-cleaned', 'Timed-out and cleaned task', NULL,
+        'Cleaned preview', 512000, 0, 0, 'agy-worker/demo-task-cleaned', 'bead1234', 'gpt-6.2-astra',
+        'xhigh', NULL, NULL, NULL, NULL, 'paginated'
+      )`
+    )
+    .run(nowSec - 1200, nowSec - 600, nowMs - 1200000, nowMs - 600000);
   stateDb.close();
 
   // 2. goals_1.sqlite
@@ -105,6 +115,13 @@ function createSyntheticCodexHome(codexHome, dispatchDir) {
       )`
     )
     .run(nowSec - 60);
+  histDb
+    .prepare(
+      `INSERT INTO thread_turns VALUES (
+        '01a90000-0000-7000-8000-000000000003', 'turn-1', 1, 'inProgress', NULL, ?, NULL, NULL
+      )`
+    )
+    .run(nowSec - 1200);
   histDb
     .prepare(
       `INSERT INTO thread_items VALUES (
@@ -165,11 +182,29 @@ function createSyntheticCodexHome(codexHome, dispatchDir) {
           isolation: 'worktree',
           sandbox: 'workspace-write',
           session_id: '01a90000-0000-7000-8000-000000000001',
-          status: 'completed',
-          exit_code: 0,
+          status: 'running',
+          exit_code: null,
           created_at: '2026-11-24T00:00:00+00:00',
           updated_at: '2026-11-24T01:00:00+00:00',
           run_dir: path.join(dispatchDir, 'runs', 'demo-task-1'),
+        },
+        'demo-task-cleaned': {
+          task_id: 'demo-task-cleaned',
+          backend: 'codex',
+          model: 'gpt-6.2-astra',
+          effort: 'xhigh',
+          difficulty: 'hard',
+          repo_root: '/tmp/acme-api',
+          worktree_path: '/tmp/worktrees/acme-api/demo-task-cleaned',
+          branch: 'agy-worker/demo-task-cleaned',
+          isolation: 'worktree',
+          sandbox: 'workspace-write',
+          session_id: '01a90000-0000-7000-8000-000000000003',
+          status: 'cleaned',
+          exit_code: 124,
+          created_at: '2026-11-24T00:00:00+00:00',
+          updated_at: '2026-11-24T00:15:00+00:00',
+          run_dir: path.join(dispatchDir, 'runs', 'demo-task-cleaned'),
         },
       },
     })
@@ -266,13 +301,19 @@ async function runTests() {
     assert.equal(snap.connected, true);
     assert.equal(snap.stats.runningCount, 1);
     assert.equal(snap.stats.goalBlockedCount, 1);
-    assert.equal(snap.stats.agyCount, 1);
-    assert.equal(snap.stats.managedCount, 1);
+    assert.equal(snap.stats.agyCount, 2);
+    assert.equal(snap.stats.managedCount, 2);
     const agyTask = snap.tasks.find((t) => t.id === '01a90000-0000-7000-8000-000000000001');
+    const cleanedTask = snap.tasks.find((t) => t.id === '01a90000-0000-7000-8000-000000000003');
+    assert.equal(cleanedTask.status.code, 'exec_done');
+    assert.equal(cleanedTask.status.label, '已清理(曾超时)');
+    const cleanedAgent = snap.managedAgents.find((m) => m.id === 'demo-task-cleaned');
+    assert.equal(cleanedAgent.status, 'cleaned');
     assert.equal(agyTask.isManagedDispatch, true);
     assert.equal(agyTask.latestReply, 'Implemented JWT auth with 18 passing tests.');
-    assert.equal(snap.managedAgents[0].summary, 'Resume turn verified all 18 tests cleanly.');
-    assert.equal(snap.managedAgents[0].changedFiles.length, 2);
+    const demoAgent = snap.managedAgents.find((m) => m.id === 'demo-task-1');
+    assert.equal(demoAgent.summary, 'Resume turn verified all 18 tests cleanly.');
+    assert.equal(demoAgent.changedFiles.length, 2);
 
     // 4b. Verify dual-window quota picks minimum remaining (5h 51% < weekly 88%)
     assert.equal(snap.quota?.available, true);
