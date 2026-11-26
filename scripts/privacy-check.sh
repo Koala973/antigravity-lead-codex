@@ -13,8 +13,6 @@ PATTERNS=(
   "feishu-change-bot"
   "delonix_ai_steward"
   "\.hermes/node"
-  "ZCode\.app"
-  "zcode\.cjs"
 )
 
 FOUND=0

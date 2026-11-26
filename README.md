@@ -162,7 +162,7 @@ bash scripts/install.sh
 
 ## 启用与自检
 
-1. **打开侧栏控制台**：在 Antigravity 右侧辅助栏点击 **`+`** → 选择 **`Codex Console`**（也可从左侧边栏直接打开全页版）。
+1. **打开侧栏控制台**：在 Antigravity 右侧辅助栏点击 **`+`** → 选择 **`Antigravity Lead Codex`**（也可从左侧边栏直接打开全页版）。
 2. **一键环境与协议体检**：
 
 ```bash

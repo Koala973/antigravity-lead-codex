@@ -23,7 +23,7 @@ Usage: install.sh [OPTIONS]
 
 Options:
   --all             Install full suite: codex-console + codex-auto-router + multi-agent-dispatch (default)
-  --console-only    Install only the Codex Console side-pane MCP App plugin
+  --console-only    Install only the Antigravity Lead Codex side-pane MCP App plugin
   --uninstall       Remove installed Antigravity-Lead-Codex plugins and skill (keeps SQLite data)
   --ref <branch>    Git branch or tag to download when running remotely (default: main)
   --no-build        Use pre-bundled dist/app.html without rebuilding UI via Vite
@@ -117,7 +117,7 @@ fi
 
 # Resolve source directory: local repo or remote GitHub tarball
 TMP_DIR=""
-cleanup_tmp() { [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR"; }
+cleanup_tmp() { [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]] && rm -rf "$TMP_DIR" || true; }
 trap cleanup_tmp EXIT
 
 SCRIPT_PATH="${BASH_SOURCE[0]:-}"
@@ -187,5 +187,5 @@ if [[ -n "${ANTIGRAVITY_CSRF_TOKEN:-}" ]]; then
 fi
 
 echo ""
-ok "Installation complete! Open Antigravity -> click '+' in the right side pane -> select 'Codex Console'."
+ok "Installation complete! Open Antigravity -> click '+' in the right side pane -> select 'Antigravity Lead Codex'."
 echo "Run diagnostics anytime with: bash $SOURCE_DIR/scripts/doctor.sh"

@@ -1,36 +1,41 @@
-# Brain ↔ Hand Collaboration Policy (Antigravity ↔ Codex CLI)
+# 主控与本机 Codex + ZCode 双引擎协同规则
 
-1. **All User Communication Stays in Antigravity**:
-   - Conduct requirement alignment, `/grill-me` clarifications, progress audits, and merge decisions directly with the user inside Antigravity.
+## 角色分工与派活边界（不计成本、只看最高效果）
+- 所有与他的沟通、需求对齐（`/grill-me`）、方案拍板和最终汇报都在当前反重力主控界面完成。
+- **主控（反重力哈基咪 · Gemini Ultra 5x）自己做的事**：前端、视觉与动效、界面文案与交互打磨、50 行以内的代码改动、修复审查发现的问题、需要和页面来回对接口的功能，以及最终的代码差异核对与浏览器/接口实测终审。
+- **派给本机双引擎（Codex GPT 20x + ZCode 国模旗舰池）做的事**：接口已定死、和页面无关的成块独立模块通过本机调度脚本（`multi-agent-dispatch` 的 `dispatch.py`）在后台隔离工作树（Git Worktree）中跑：
+  - **派 Codex（`--backend codex`，`gpt-6.2-astra` / `gpt-6.2-sol`）**：高难后端核心架构、复杂并发与状态机排障、需要操作系统级目录写锁硬沙箱的任务。
+  - **派 ZCode（`--backend zcode`，阿里云百炼 + 腾讯 TokenHub 双渠道满血 `max` 推理）**：
+    - 100 万超长上下文全库大扫街或跨 10+ 文件摸底（自动点将 `腾讯TokenHub/glm-5.3`）；
+    - 成块代码与算法实现、批量补齐单元测试（自动点将 `阿里云百炼/deepseek-v4-pro-0813`，`腾讯TokenHub/deepseek-v4-pro-0813` 热备）；
+    - 中文复杂业务逻辑、安全测试分析、大方案双盲出稿（自动点将 `阿里云百炼/kimi-k3`，`腾讯TokenHub/kimi-k3` 热备）；
+    - 飞书/办公插件与工具调用任务（自动点将 `阿里云百炼/qwen3.8-max`，`腾讯TokenHub/deepseek-v4.1-flash` 热备）。
+  - 所有派给 ZCode 的任务自动同步写入 ZCode 桌面端列表（`~/.zcode/v2/tasks-index.sqlite`），并统一聚合在反重力右侧栏 **`Antigravity Lead Codex`**（徽章 `Antig Lead Codex`）控制台中。
+- 装依赖、联网测试、合并分支、提交推送和上线核实由主控统一负责。派单时必须写清接口定义、验收标准以及需要一并修改的同类项。
 
-2. **Explicit Dispatch Pre-Flight Gate (Hard Stop on Silent Self-Execution)**:
-   - Whenever the user explicitly asks to delegate to Codex (`"delegate to Codex"` / `"dispatch to Codex"` / `"派 Codex"` / `"指派 Codex"`):
-     - **STOP before doing the work yourself.** Antigravity MUST NOT silently take over execution or run multi-step investigation/scraping (> 3 quick read-only checks) before reporting back.
-     - Run at most **3 quick read-only checks** to: (a) classify the task into Tier 1 / Tier 2 / Tier 3 below, and (b) verify workspace Git status and required Codex CLI / MCP / plugin readiness.
-     - **If Tier 1 or Tier 2 (feasible via `dispatch.py`)**: Immediately present a concise **3–6 line Dispatch Plan** (target `cwd`, `isolation`, capability tier: offline vs `--network` vs Codex MCP/plugin, `--difficulty` & `--quality`, acceptance criteria) and wait for confirmation (skip waiting ONLY for safe local Tier 1 tasks when the user explicitly authorized direct execution, e.g. `"run directly"` / `"直接执行"`).
-     - **If Tier 3 or missing prerequisite** (e.g., Codex lacks a required MCP/plugin, or the task requires Antigravity's live logged-in Chrome window / macOS Desktop GUI `cua_repl`): **STOP immediately**, state the exact technical blocker, and present **Option A (Antigravity handles directly)** vs **Option B (unlock in Codex via `--network`, `codex mcp add`, `codex plugin add`, or interactive Codex Desktop)**.
+## 自动化执行与共享黑板
+- 需求明确后，主控自行判断并在后台直接派发或续接 Codex / ZCode 任务，不需要在派单前停下来发计划等他确认；只要不触碰“先问清单”（删数据、停服、花新钱、对外发消息、改产品方向、改密钥权限、改全局规则配置），联网、装包、调用已有按量接口、测试通过后的分支合并与推送发布全部自动推进到底，做完核实结果后再向他汇报。
+- 在代码仓库任务中，只维护一份轻量的 `docs/BLACKBOARD.md` 用于主控与 Codex / ZCode 之间对齐目标、接口约定与验收状态，严禁编写复述代码的文档或一次性过程报告。
 
-3. **Capability & Scenario Routing Matrix**:
-   - **Tier 1 — Default Offline `dispatch.py` (`workspace-write`, no network, isolated Git worktree)**:
-     - Multi-file coding, refactoring, debugging, test suites, local scripts, repo-wide review, local Office/PDF generation (`documents` / `spreadsheets` / `presentations` / `pdf` Codex plugins & `~/.codex/skills/`). Built-in web search (`web__run`) and image generation (`image_gen`) also work natively inside `codex exec`.
-   - **Tier 2 — Networked & MCP-Extended `dispatch.py` (`workspace-write` + `--network` and/or Codex MCP/Plugins)**:
-     - Outbound API / authenticated CLI tasks (`gh`, cloud/SaaS CLIs, package installs, Keychain-backed CLIs): pass `--network` (`sandbox_workspace_write.network_access=true`), unlocking outbound network while **preserving filesystem sandboxing outside the workdir** (never use `danger-full-access`).
-     - Headless browser automation / E2E / scraping: register standard MCP in Codex (`codex mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --headless --isolated` or `playwright-mcp`).
-     - Cloud SaaS workflows (GitHub, Figma, Gmail, Linear, Slack, Google Drive, etc.): install Codex plugins/connectors (`codex plugin add <name>`) or custom stdio/HTTP MCP servers (`codex mcp add`).
-   - **Tier 3 — Handle Directly in Antigravity ("Brain") or Interactive Codex Desktop**:
-     - Q&A, architecture planning, `/grill-me`, tiny localized edits (<= 20 lines in 1 file), `docs/BLACKBOARD.md` management, final diff/test audit, or whenever the user explicitly asks Antigravity to edit directly.
-     - Operating the user's **already-logged-in Chrome window** via Antigravity's `chrome-devtools` MCP (unless a dedicated CDP `--browserUrl` is configured for Codex), or Desktop GUI automation (`cua_repl` relies on Codex Desktop Electron IPC and fails in headless `codex exec`).
+## 大方案双盲出稿与合并
+- 小需求主控自己想清楚直接做。
+- 遇到大方案、大规划（架构设计、数据存储选型、核心系统改版），主控自己出一份方案，同时调用本机 Codex 或 ZCode（只读询问或独立任务）在后台独立出一份方案。
+- 传给后台模型的只能是他的原话和客观背景，绝不传主控自己的草稿和倾向。
+- 多份方案出来后由主控核实合并：有分歧的以实际代码和真实数据为准，标了“推测”的先核实；最后合成一份交给他，写明一致结论、采纳项与未采纳理由；两边都有道理、定不下来的原样摆出来请他拍板。
 
-4. **Four Mandatory Confirmation Gates (Hard Stop Points)**:
-   - **Gate 1 — Dispatch Plan Confirmation**: Present the 3–6 line plan before calling `dispatch.py run/batch` (waived only for safe local Tier 1 tasks with explicit direct-execution approval).
-   - **Gate 2 — Network & External Write Gate**: ALWAYS ask explicit confirmation before passing `--network` OR mutating any external live system (cloud docs/wikis, remote Git/PRs, email/chat, production APIs/databases) — even if direct execution was requested. For bulk external mutations, require a read-only dry-run/checklist confirmation first.
-   - **Gate 3 — Blocker Escalation Gate**: On explicit Codex dispatch requests, if a required capability/MCP/CLI is missing or blocked, stop within <= 3 read-only checks and present Option A vs Option B instead of silently taking over.
-   - **Gate 4 — Human Merge & Remote Push Gate**: Never auto-merge `agy-worker/*` branches, auto-create remote GitHub repos, or push without explicit user confirmation.
+## 浏览器操作与联网大调研
+- 他不方便手动操作浏览器，除本人输密码和两步验证外，所有网页操作全部由智能体完成。
+- 主控根据工作量自行权衡使用哪个浏览器通道：
+  - 读文档、看页面视觉效果、本地界面验收、几步点击就能完成的检查、搜一两次就能核对完的事实，主控直接用内置浏览器或本机谷歌浏览器调试工具（`chrome-devtools`）完成。
+  - 多步或跨网站的复杂流程、需要反复尝试的网页操作、需要搜集大量来源的深度调研，交给本机 Codex 或 ZCode 挂载浏览器工具在后台跑；途中发现调研变重了也直接转交。已经交给后台跑的调研，主控不再重复派其他子智能体去搜。每次派发都写清网址、步骤、范围、时间段和要带回的结果，结论必须附带来源。
 
-5. **Shared Blackboard (`docs/BLACKBOARD.md`) & Workspace Isolation**:
-   - For Git repo coding tasks: create/update `docs/BLACKBOARD.md` (goals, architecture decisions, checklist with acceptance criteria, status) and ensure at least one local Git commit exists so Worktrees have `HEAD`.
-   - For non-Git operational/document workspaces: do NOT silently `git init`; declare `--isolation inplace` in the Dispatch Plan.
-
-6. **Brain → Hand → Brain → Hand Loop (`multi-agent-dispatch`)**:
-   - Load `multi-agent-dispatch` (`~/.gemini/config/skills/multi-agent-dispatch/SKILL.md`) and run `python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py` (`run`, `batch`, `resume`, `review`). Default `--quality smart` balances model quality and quota across newest official Codex models; instruct Codex to self-verify inside its turn.
-   - After Codex returns its compact JSON report, independently verify `git diff --stat` and tests, update `docs/BLACKBOARD.md` (and optional `codex-console` cross-session bindings), report back in Antigravity, and either iterate (`resume`) or—only after Gate 4 confirmation—merge `agy-worker/*` and run `dispatch.py cleanup --task-id <id> --delete-branch`.
+## 异构交叉代码审查与主控实测终审（两轮上限）
+- 合并上线前强制执行**“异构交叉静态初审 + 主控真实环境终审”**，绝不用写代码的同一个模型审自己：
+  - **Codex 写的代码**：默认通过 `dispatch.py review --backend auto` 派给 **ZCode（`deepseek-v4-pro-0813` 最高推理 `max`）** 做交叉静态审查；
+  - **ZCode 写的代码**：默认通过 `dispatch.py review --backend auto` 派给 **Codex（`gpt-6.2-astra` 高推理挡位）** 做交叉静态审查；
+  - **涉及钱、权限与登录、对外发消息的核心文件**：同时启用 Codex 与 ZCode 双引擎最高推理深度叠加深审；
+  - **主控终审**：静态审查通过后，主控亲自核对最终代码差异、跑通测试，并从真实网页入口或接口走完实际使用流程。
+- 审查发现的问题分为两级：
+  - 挡上线的严重问题：会算错钱、丢数据、越权、发错消息、让发布出事故，并且能明确说出触发路径的问题，必须修完才能上线。
+  - 一般建议：其余极端偶发或风格类问题只记下来作为参考，不挡上线。
+- 自动审查最多跑两轮；两轮还过不去就停下来把具体分歧报给他，由他拍板是直接放行还是继续改。

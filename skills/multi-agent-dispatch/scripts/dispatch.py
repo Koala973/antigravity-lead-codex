@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Local multi-agent dispatcher for Antigravity (Brain) -> Codex CLI (Hand).
+"""Local multi-agent dispatcher for Antigravity -> Codex 100x & ZCode National Flagships.
 
-Dynamically discovers the newest official Codex frontier models from models_cache.json,
-defaults to smart quality+quota (--quality smart) routing across flagship and wide_fast
-models (with --quality max and --quality balanced overrides), manages isolated Git
-worktrees, enforces safe headless sandbox overrides, and returns compact structured
-JSON summaries to preserve Antigravity context quota.
+Dynamically discovers the newest official Codex frontier models from models_cache.json
+and ZCode dual-channel national flagship models (Alibaba Bailian + Tencent TokenHub),
+supports smart quality+difficulty routing with automatic cross-provider failover,
+manages isolated Git worktrees, syncs ZCode CLI sessions into ZCode Desktop's left
+sidebar (tasks-index.sqlite), supports heterogeneous cross-engine code review
+(--backend auto), and returns compact structured JSON summaries.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import uuid
@@ -39,6 +41,22 @@ LOCK_FILE = STATE_DIR / "state.lock"
 RUNS_DIR = STATE_DIR / "runs"
 WORKTREES_DIR = STATE_DIR / "worktrees"
 
+ZCODE_HOME = Path(os.environ.get("ZCODE_HOME", os.path.expanduser("~/.zcode")))
+ZCODE_SCRIPT = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
+ZCODE_BUILTIN_PROVIDER_CONFIG = Path(
+    "/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json"
+)
+ZCODE_PERSONAL_PROVIDER_CONFIG = ZCODE_HOME / "v2" / "provider_config.json"
+ZCODE_TASKS_INDEX_DB = ZCODE_HOME / "v2" / "tasks-index.sqlite"
+ZCODE_CLI_DB = ZCODE_HOME / "cli" / "db" / "db.sqlite"
+
+ZCODE_PROVIDER_BAILIAN = "qwen-alibaba-model-studio-cn"
+ZCODE_PROVIDER_TOKENHUB = "e2a41300-b652-45ec-9f78-ebd2ec7889be"
+ZCODE_PROVIDER_LABELS = {
+    ZCODE_PROVIDER_BAILIAN: "阿里云百炼",
+    ZCODE_PROVIDER_TOKENHUB: "腾讯TokenHub",
+}
+
 BUNDLED_CODEX_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
 MODELS_CACHE_PATHS = (
     Path(os.path.expanduser("~/.codex/models_cache.json")),
@@ -47,7 +65,8 @@ MODELS_CACHE_PATHS = (
 
 VALID_DIFFICULTIES = ("auto", "low", "medium", "hard", "extreme")
 VALID_QUALITIES = ("smart", "max", "balanced")
-VALID_BACKENDS = ("codex",)
+VALID_BACKENDS = ("codex", "zcode")
+VALID_REVIEW_BACKENDS = ("auto", "codex", "zcode")
 VALID_SANDBOXES = ("read-only", "workspace-write")
 VALID_ISOLATIONS = ("auto", "worktree", "inplace")
 
@@ -97,6 +116,32 @@ HARD_KEYWORDS = (
     "性能优化",
     "跨模块",
     "迁移",
+)
+CODE_IMPL_KEYWORDS = (
+    "implement",
+    "code",
+    "function",
+    "class",
+    "api",
+    "endpoint",
+    "bug",
+    "fix",
+    "test",
+    "pytest",
+    "unittest",
+    "sql",
+    "script",
+    "实现",
+    "代码",
+    "接口",
+    "函数",
+    "修复",
+    "报错",
+    "单测",
+    "测试",
+    "脚本",
+    "审计",
+    "审查",
 )
 LOW_KEYWORDS = (
     "typo",
@@ -200,7 +245,6 @@ def list_codex_candidates() -> list[dict[str, Any]]:
         shutil.which("codex"),
         os.path.expanduser("~/.local/bin/codex"),
         os.path.expanduser("~/.npm-global/bin/codex"),
-        os.path.expanduser("~/.volta/bin/codex"),
         "/opt/homebrew/bin/codex",
         "/usr/local/bin/codex",
     ]
@@ -376,6 +420,46 @@ def discover_frontier_models() -> dict[str, Any]:
     return best
 
 
+def discover_zcode_models() -> dict[str, Any]:
+    """Inspect local ~/.zcode/v2/provider_config.json for configured providers and models."""
+    cfg_path = Path(
+        os.environ.get("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", str(ZCODE_PERSONAL_PROVIDER_CONFIG))
+    )
+    if not cfg_path.exists():
+        return {"exists": False, "source_file": str(cfg_path), "providers": []}
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"exists": False, "source_file": str(cfg_path), "providers": []}
+
+    rules = (
+        raw.get("config", {})
+        .get("providerConfigRules", {})
+        .get("providerRules", [])
+    )
+    providers: list[dict[str, Any]] = []
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        pid = str(r.get("providerId") or "").strip()
+        pname = str(r.get("providerName") or ZCODE_PROVIDER_LABELS.get(pid, pid)).strip()
+        rcfg = r.get("config") or {}
+        models = list(rcfg.get("modelOrder") or rcfg.get("personalModelIds") or [])
+        if pid:
+            providers.append(
+                {
+                    "provider_id": pid,
+                    "provider_name": pname,
+                    "models": [str(m) for m in models if isinstance(m, str) and "/" not in m],
+                }
+            )
+    return {
+        "exists": True,
+        "source_file": str(cfg_path),
+        "providers": providers,
+    }
+
+
 def pick_supported_effort(preferred_chain: tuple[str, ...], supported_efforts: list[str]) -> str:
     if not supported_efforts:
         return preferred_chain[0]
@@ -405,6 +489,118 @@ def classify_difficulty(prompt: str, files_hint: list[str] | None = None) -> tup
         if len(prompt.strip()) <= 140:
             return "low", "short localized prompt (<=140 chars)"
     return "medium", "default medium-tier implementation scope"
+
+
+def resolve_zcode_model_and_fallbacks(
+    *,
+    difficulty: str,
+    prompt: str,
+    files_hint: list[str] | None = None,
+    explicit_model: str | None = None,
+    explicit_effort: str | None = None,
+    prefer_wide: bool = False,
+    is_review: bool = False,
+) -> dict[str, Any]:
+    """Select the optimal ZCode flagship model & multi-provider failover chain based on live benchmarks."""
+    if difficulty == "auto":
+        effective_difficulty, difficulty_reason = classify_difficulty(prompt, files_hint)
+    else:
+        effective_difficulty = difficulty
+        difficulty_reason = f"explicit difficulty={difficulty}"
+
+    use_wide = prefer_wide or len(files_hint or []) >= 10
+    text_l = prompt.lower()
+    is_code_heavy = is_review or effective_difficulty == "hard" or any(kw in text_l for kw in CODE_IMPL_KEYWORDS)
+
+    if use_wide:
+        scenario = "wide_1m_context"
+        base_chain = [
+            (ZCODE_PROVIDER_TOKENHUB, "glm-5.3", "max", "腾讯TokenHub 100万窗口主选"),
+            (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 一级热备"),
+            (ZCODE_PROVIDER_BAILIAN, "deepseek-v4-pro-0813", "max", "阿里云百炼 二级热备"),
+        ]
+    elif is_code_heavy:
+        scenario = "code_and_audit_flagship"
+        base_chain = [
+            (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 多轮工具/代码审计主选(6.1s)"),
+            (ZCODE_PROVIDER_BAILIAN, "deepseek-v4-pro-0813", "max", "阿里云百炼 深度代码一级热备(TTFT 2.2s)"),
+            (ZCODE_PROVIDER_TOKENHUB, "deepseek-v4-pro-0813", "max", "腾讯TokenHub 跨渠道二级热备"),
+            (ZCODE_PROVIDER_TOKENHUB, "kimi-k3", "max", "腾讯TokenHub 跨渠道三级热备"),
+        ]
+    elif effective_difficulty in ("medium", "extreme"):
+        scenario = "reasoning_and_business_flagship"
+        base_chain = [
+            (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 综合/业务主选(6.1s)"),
+            (ZCODE_PROVIDER_TOKENHUB, "kimi-k3", "max", "腾讯TokenHub 同模型一级热备"),
+            (ZCODE_PROVIDER_BAILIAN, "qwen3.8-max", "xhigh", "阿里云百炼 异构二级热备(7.8s)"),
+        ]
+    else:
+        scenario = "fast_tool_flagship"
+        base_chain = [
+            (ZCODE_PROVIDER_BAILIAN, "qwen3.8-max", "xhigh", "阿里云百炼 工具/轻量主选(7.8s)"),
+            (ZCODE_PROVIDER_TOKENHUB, "deepseek-v4.1-flash", "max", "腾讯TokenHub 零报错一级热备"),
+            (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 二级热备"),
+        ]
+
+    chain: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add_candidate(pid: str, mid: str, eff: str, note: str) -> None:
+        key = (pid, mid)
+        if key in seen:
+            return
+        seen.add(key)
+        chain.append(
+            {
+                "provider_id": pid,
+                "provider_label": ZCODE_PROVIDER_LABELS.get(pid, pid),
+                "model_id": mid,
+                "full_model": f"{pid}/{mid}",
+                "effort": explicit_effort or eff,
+                "note": note,
+            }
+        )
+
+    if explicit_model and explicit_model.strip() and explicit_model.strip() != "zcode-default":
+        raw_m = explicit_model.strip()
+        if "/" in raw_m:
+            pid, mid = raw_m.split("/", 1)
+            eff = "xhigh" if "qwen" in mid else "max"
+            _add_candidate(pid.strip(), mid.strip(), eff, "用户显式指定渠道与模型")
+        else:
+            eff = "xhigh" if "qwen" in raw_m else "max"
+            if raw_m == "glm-5.3":
+                _add_candidate(ZCODE_PROVIDER_TOKENHUB, raw_m, eff, "用户显式指定 100万窗口 GLM-5.3")
+            elif raw_m == "deepseek-v4.1-flash":
+                _add_candidate(ZCODE_PROVIDER_TOKENHUB, raw_m, eff, "用户显式指定 DeepSeek-V4.1-Flash")
+            else:
+                _add_candidate(ZCODE_PROVIDER_BAILIAN, raw_m, eff, "用户显式指定模型(阿里云百炼优先)")
+                if raw_m in ("kimi-k3", "deepseek-v4-pro-0813"):
+                    _add_candidate(ZCODE_PROVIDER_TOKENHUB, raw_m, eff, "用户显式指定模型(腾讯TokenHub同模热备)")
+
+    for pid, mid, eff, note in base_chain:
+        _add_candidate(pid, mid, eff, note)
+
+    primary = chain[0]
+    return {
+        "requested_difficulty": difficulty,
+        "effective_difficulty": effective_difficulty,
+        "difficulty_reason": difficulty_reason,
+        "scenario": scenario,
+        "prefer_wide": use_wide,
+        "provider_id": primary["provider_id"],
+        "provider_label": primary["provider_label"],
+        "model_id": primary["model_id"],
+        "model": primary["full_model"],
+        "effort": primary["effort"],
+        "fallback_chain": chain,
+        "rr_slot": None,
+        "route_note": (
+            f"zcode scenario={scenario}, difficulty={effective_difficulty} -> "
+            f"{primary['provider_label']}/{primary['model_id']} (effort={primary['effort']}, "
+            f"backups={len(chain) - 1})"
+        ),
+    }
 
 
 def resolve_model_and_effort(
@@ -890,6 +1086,301 @@ def parse_report_file(
     }
 
 
+def parse_zcode_output(stdout_text: str, stderr_text: str, exit_code: int) -> dict[str, Any]:
+    """Parse zcode --json output (either single JSON document or NDJSON lines)."""
+    session_id: str | None = None
+    assistant_texts: list[str] = []
+    usage: dict[str, Any] | None = None
+
+    stripped = stdout_text.strip()
+    parsed_objs: list[Any] = []
+    if stripped:
+        try:
+            parsed_objs.append(json.loads(stripped))
+        except json.JSONDecodeError:
+            for line in stripped.splitlines():
+                ln = line.strip()
+                if not ln:
+                    continue
+                try:
+                    parsed_objs.append(json.loads(ln))
+                except json.JSONDecodeError:
+                    continue
+
+    for obj in parsed_objs:
+        if session_id is None:
+            session_id = extract_session_id_from_obj(obj)
+        if isinstance(obj, dict):
+            if isinstance(obj.get("usage"), dict):
+                usage = obj["usage"]
+            for key in ("result", "response", "text", "content", "message", "output"):
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    assistant_texts.append(val.strip())
+                elif isinstance(val, dict) and isinstance(val.get("text"), str):
+                    assistant_texts.append(val["text"].strip())
+
+    raw_summary = assistant_texts[-1] if assistant_texts else stripped
+    if not raw_summary:
+        raw_summary = "\n".join(stderr_text.splitlines()[-20:])
+    summary = raw_summary[:2000] if raw_summary else f"ZCode exited with code {exit_code}."
+
+    return {
+        "session_id": session_id,
+        "usage": usage,
+        "report": {
+            "status": "completed" if exit_code == 0 else "failed",
+            "summary": summary,
+            "files_modified": [],
+            "commands_run": [],
+            "verification_passed": exit_code == 0,
+            "risks_or_followups": [],
+            "notes_for_orchestrator": "Raw ZCode output truncated to <=2000 chars; full stdout saved in run_dir.",
+        },
+    }
+
+
+def write_zcode_run_provider_config(
+    run_dir: Path,
+    provider_id: str,
+    model_id: str,
+    effort: str | None = None,
+) -> Path | None:
+    """Create a per-run isolated provider_config.json that pins ZCode CLI to provider_id/model_id."""
+    base_path = Path(
+        os.environ.get("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", str(ZCODE_PERSONAL_PROVIDER_CONFIG))
+    )
+    if not base_path.exists():
+        return None
+    try:
+        cfg = json.loads(base_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    c_root = cfg.setdefault("config", {})
+    cur_order = list(c_root.get("providerOrder") or [])
+    c_root["providerOrder"] = [provider_id] + [p for p in cur_order if p != provider_id]
+
+    sel: dict[str, Any] = {"providerId": provider_id, "modelId": model_id}
+    if effort and effort not in ("n/a", "auto"):
+        sel["options"] = {"reasoningLevel": effort}
+    c_root["defaultModelSelection"] = sel
+
+    rules = c_root.get("providerConfigRules", {}).get("providerRules", [])
+    if isinstance(rules, list):
+        for rule in rules:
+            if isinstance(rule, dict) and rule.get("providerId") == provider_id:
+                rcfg = rule.setdefault("config", {})
+                m_order = list(rcfg.get("modelOrder") or [])
+                rcfg["modelOrder"] = [model_id] + [m for m in m_order if m != model_id]
+                p_ids = list(rcfg.get("personalModelIds") or [])
+                rcfg["personalModelIds"] = [model_id] + [m for m in p_ids if m != model_id]
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    out_file = run_dir / "provider_config.json"
+    out_file.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return out_file
+
+
+def build_zcode_env(override_personal_config: Path | None = None) -> dict[str, str]:
+    """Inject ZCode.app provider config paths when invoking bundled zcode.cjs directly."""
+    env = os.environ.copy()
+    if ZCODE_BUILTIN_PROVIDER_CONFIG.exists() and "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE" not in env:
+        env["ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"] = str(ZCODE_BUILTIN_PROVIDER_CONFIG)
+    if override_personal_config and override_personal_config.exists():
+        env["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"] = str(override_personal_config)
+    elif ZCODE_PERSONAL_PROVIDER_CONFIG.exists() and "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE" not in env:
+        env["ZCODE_PERSONAL_PROVIDER_CONFIG_FILE"] = str(ZCODE_PERSONAL_PROVIDER_CONFIG)
+    return env
+
+
+def sync_zcode_session_to_desktop_index(
+    *,
+    session_id: str | None,
+    workspace_path: Path,
+    title_hint: str,
+    model_full: str,
+    effort: str,
+    sandbox: str,
+    status: str,
+    summary_text: str = "",
+    worktree_root: str | None = None,
+) -> bool:
+    """Sync a ZCode CLI session into ~/.zcode/v2/tasks-index.sqlite so it appears in ZCode.app Desktop."""
+    if not session_id or not session_id.startswith("sess_"):
+        return False
+    idx_db_path = Path(os.environ.get("ZCODE_TASKS_INDEX_DB", str(ZCODE_TASKS_INDEX_DB)))
+    cli_db_path = Path(os.environ.get("ZCODE_CLI_DB", str(ZCODE_CLI_DB)))
+    if not idx_db_path.exists():
+        return False
+
+    ws_str = str(workspace_path.resolve())
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    clean_title = re.sub(r"\s+", " ", title_hint.replace("[Execution Contract]", "").strip())[:90] or session_id
+    actual_model = model_full
+    created_ms = now_ms
+    updated_ms = now_ms
+
+    if cli_db_path.exists():
+        try:
+            with contextlib.closing(
+                sqlite3.connect(f"file:{cli_db_path}?mode=ro", uri=True, timeout=2.0)
+            ) as conn_cli:
+                cur_cli = conn_cli.cursor()
+                srow = cur_cli.execute(
+                    "SELECT title, time_created, time_updated FROM session WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if srow:
+                    if srow[0] and str(srow[0]).strip():
+                        clean_title = str(srow[0]).strip()[:120]
+                    if srow[1] is not None:
+                        created_ms = int(srow[1])
+                    if srow[2] is not None:
+                        updated_ms = int(srow[2])
+                urow = cur_cli.execute(
+                    "SELECT provider_id, model_id FROM model_usage WHERE session_id = ? ORDER BY started_at DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if urow and urow[0] and urow[1]:
+                    actual_model = f"{urow[0]}/{urow[1]}"
+        except (sqlite3.Error, ValueError, TypeError, OSError):
+            pass
+
+    zmode = "plan" if sandbox == "read-only" else "build"
+    zstatus = "completed" if status == "completed" else ("failed" if status in ("failed", "timed_out") else "running")
+    thought_level = effort if effort not in ("n/a", "", None) else "max"
+
+    try:
+        with contextlib.closing(sqlite3.connect(str(idx_db_path), timeout=4.0)) as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA busy_timeout = 4000;")
+
+            # Match or register project & project_root so ZCode Desktop groups the task under its project folder
+            prow = cur.execute(
+                "SELECT project_id, root_path FROM project_roots WHERE ? = root_path OR ? LIKE root_path || '/%' ORDER BY LENGTH(root_path) DESC LIMIT 1",
+                (ws_str, ws_str),
+            ).fetchone()
+            if prow:
+                project_id, root_path = str(prow[0]), str(prow[1])
+            else:
+                project_id = str(uuid.uuid4())
+                root_path = ws_str
+                proj_name = workspace_path.name or "Workspace"
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO projects (
+                        project_id, host_id, name, name_overridden, position,
+                        pinned, pinned_at, deleted, deleted_at, created_at, updated_at
+                    ) VALUES (?, 'local', ?, 0, 0, 0, NULL, 0, NULL, ?, ?)
+                    """,
+                    (project_id, proj_name, created_ms, updated_ms),
+                )
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO project_roots (project_id, root_path, position, is_primary)
+                    VALUES (?, ?, 0, 1)
+                    """,
+                    (project_id, root_path),
+                )
+
+            meta_obj = {
+                "taskId": session_id,
+                "traceId": str(uuid.uuid4()),
+                "title": clean_title,
+                "titleOverridden": False,
+                "workspacePath": root_path,
+                "createdAt": created_ms,
+                "updatedAt": updated_ms,
+                "mode": zmode,
+                "model": actual_model,
+                "thoughtLevel": thought_level,
+                "provider": "glm",
+                "status": zstatus,
+                "target": None,
+            }
+            searchable = f"{clean_title}\n{summary_text}".strip()[:4000]
+
+            cur.execute(
+                """
+                INSERT INTO tasks (
+                    workspace_key, workspace_path, workspace_identity, task_id, title,
+                    task_status, provider, mode, model, migration_source, forked_from_task_id,
+                    created_at, updated_at, unread_at, last_unread_at, pinned, archived, deleted,
+                    title_overridden, meta_json, searchable_text, cron_automation_id, off_peak_task_id,
+                    host_id, root_path, project_id, execution_directories, sort_order,
+                    cli_title, handoff_pending, cli_title_source, cli_created_at, cli_updated_at,
+                    cli_last_outcome, cli_deleted, worktree_root
+                ) VALUES (
+                    ?, ?, NULL, ?, ?,
+                    ?, 'glm', ?, ?, NULL, NULL,
+                    ?, ?, NULL, ?, 0, 0, 0,
+                    0, ?, ?, NULL, NULL,
+                    'local', ?, ?, NULL, NULL,
+                    ?, 0, 'generated', ?, ?,
+                    ?, 0, ?
+                )
+                ON CONFLICT(workspace_key, task_id) DO UPDATE SET
+                    title = excluded.title,
+                    task_status = excluded.task_status,
+                    mode = excluded.mode,
+                    model = excluded.model,
+                    updated_at = excluded.updated_at,
+                    meta_json = excluded.meta_json,
+                    searchable_text = excluded.searchable_text,
+                    cli_title = excluded.cli_title,
+                    cli_updated_at = excluded.cli_updated_at,
+                    cli_last_outcome = excluded.cli_last_outcome,
+                    worktree_root = COALESCE(excluded.worktree_root, tasks.worktree_root)
+                """,
+                (
+                    root_path,
+                    root_path,
+                    session_id,
+                    clean_title,
+                    zstatus,
+                    zmode,
+                    actual_model,
+                    created_ms,
+                    updated_ms,
+                    updated_ms,
+                    json.dumps(meta_obj, ensure_ascii=False),
+                    searchable,
+                    root_path,
+                    project_id,
+                    clean_title,
+                    created_ms,
+                    updated_ms,
+                    zstatus,
+                    worktree_root,
+                ),
+            )
+
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO task_group_admissions (
+                    workspace_key, task_id, system_kind, user_organized, creation_id
+                ) VALUES (?, ?, NULL, 1, ?)
+                """,
+                (root_path, session_id, str(uuid.uuid4())),
+            )
+
+            node_key = json.dumps([root_path, session_id], ensure_ascii=False, separators=(",", ":"))
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO task_group_view_node_orders (
+                    node_type, node_key, sort_order, created_at, updated_at
+                ) VALUES ('task', ?, 0, ?, ?)
+                """,
+                (node_key, created_ms, updated_ms),
+            )
+
+            conn.commit()
+        return True
+    except (sqlite3.Error, ValueError, TypeError, OSError):
+        return False
+
+
 def make_task_id(prefix: str = "task") -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"{prefix}-{stamp}-{uuid.uuid4().hex[:6]}"
@@ -952,7 +1443,6 @@ def build_codex_resume_cmd(
 ) -> list[str]:
     if network and sandbox != "workspace-write":
         raise ValueError("--network requires --sandbox workspace-write.")
-    # codex exec resume does NOT accept -s/--sandbox or -C/--cd; use -c sandbox_mode and subprocess cwd.
     cmd = [
         codex_bin,
         "exec",
@@ -1008,6 +1498,98 @@ def run_subprocess_with_timeout(
         return 124, out, f"{err}\n[dispatcher] Timed out after {timeout}s".strip(), True
 
 
+def run_zcode_with_failover(
+    *,
+    node_bin: str,
+    prompt_text: str,
+    workdir: Path,
+    zmode: str,
+    routing: dict[str, Any],
+    run_dir: Path,
+    timeout: int,
+    resume_session_id: str | None = None,
+) -> dict[str, Any]:
+    """Execute ZCode CLI across the prioritized provider/model chain with automatic failover."""
+    chain = routing.get("fallback_chain") or [
+        {
+            "provider_id": routing.get("provider_id", ZCODE_PROVIDER_BAILIAN),
+            "provider_label": routing.get("provider_label", "阿里云百炼"),
+            "model_id": routing.get("model_id", "kimi-k3"),
+            "full_model": routing.get("model", f"{ZCODE_PROVIDER_BAILIAN}/kimi-k3"),
+            "effort": routing.get("effort", "max"),
+            "note": "default fallback",
+        }
+    ]
+
+    attempts: list[dict[str, Any]] = []
+    last_rc = 1
+    last_stdout = ""
+    last_stderr = ""
+    last_timed_out = False
+    used_candidate = chain[0]
+
+    for idx, cand in enumerate(chain):
+        used_candidate = cand
+        cfg_override = write_zcode_run_provider_config(
+            run_dir,
+            cand["provider_id"],
+            cand["model_id"],
+            cand.get("effort"),
+        )
+        cmd = [node_bin, str(ZCODE_SCRIPT)]
+        if resume_session_id:
+            cmd.extend(["--resume", resume_session_id])
+        cmd.extend([
+            "-p",
+            prompt_text,
+            "--cwd",
+            str(workdir),
+            "--mode",
+            zmode,
+            "--json",
+            "--no-color",
+        ])
+        rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
+            cmd,
+            cwd=workdir,
+            stdin_text=None,
+            timeout=timeout,
+            env=build_zcode_env(cfg_override),
+        )
+        last_rc, last_stdout, last_stderr, last_timed_out = rc, stdout_text, stderr_text, timed_out
+        attempts.append(
+            {
+                "attempt": idx + 1,
+                "provider_id": cand["provider_id"],
+                "provider_label": cand["provider_label"],
+                "model_id": cand["model_id"],
+                "full_model": cand["full_model"],
+                "effort": cand.get("effort"),
+                "exit_code": rc,
+                "timed_out": timed_out,
+            }
+        )
+        if rc == 0 and not timed_out:
+            break
+
+    routing["model"] = used_candidate["full_model"]
+    routing["model_id"] = used_candidate["model_id"]
+    routing["provider_id"] = used_candidate["provider_id"]
+    routing["provider_label"] = used_candidate["provider_label"]
+    routing["effort"] = used_candidate.get("effort", "max")
+    routing["attempts"] = attempts
+    routing["failover_triggered"] = len(attempts) > 1
+
+    return {
+        "rc": last_rc,
+        "stdout": last_stdout,
+        "stderr": last_stderr,
+        "timed_out": last_timed_out,
+        "model_used": used_candidate["full_model"],
+        "effort_used": used_candidate.get("effort", "max"),
+    }
+
+
 def execute_single_task(
     *,
     prompt: str,
@@ -1053,7 +1635,20 @@ def execute_single_task(
         model_used = routing["model"]
         effort_used = routing["effort"]
     else:
-        raise RuntimeError(f"Unsupported backend: {backend}")
+        node_bin = get_node_bin()
+        if not node_bin or not ZCODE_SCRIPT.exists():
+            raise RuntimeError("ZCode runtime (node or zcode.cjs) not found")
+        routing = resolve_zcode_model_and_fallbacks(
+            difficulty=difficulty,
+            prompt=prompt,
+            files_hint=files_hint,
+            explicit_model=model,
+            explicit_effort=effort,
+            prefer_wide=prefer_wide,
+            is_review=False,
+        )
+        model_used = routing["model"]
+        effort_used = routing["effort"]
 
     run_dir = RUNS_DIR / tid
     report_path = run_dir / "last_message.json"
@@ -1065,16 +1660,31 @@ def execute_single_task(
             if eff_isolation == "worktree"
             else cwd
         )
-        preview_cmd = build_codex_exec_cmd(
-            codex_bin=get_codex_bin() or "codex",
-            workdir=preview_workdir,
-            model=model_used,
-            effort=effort_used,
-            sandbox=sandbox,
-            network=network,
-            report_path=report_path,
-            is_git_repo=git_info["is_git_repo"],
-        )
+        if backend == "codex":
+            preview_cmd = build_codex_exec_cmd(
+                codex_bin=get_codex_bin() or "codex",
+                workdir=preview_workdir,
+                model=model_used,
+                effort=effort_used,
+                sandbox=sandbox,
+                network=network,
+                report_path=report_path,
+                is_git_repo=git_info["is_git_repo"],
+            )
+        else:
+            zmode = "plan" if sandbox == "read-only" else "build"
+            preview_cmd = [
+                get_node_bin() or "node",
+                str(ZCODE_SCRIPT),
+                "-p",
+                "<prompt>",
+                "--cwd",
+                str(preview_workdir),
+                "--mode",
+                zmode,
+                "--json",
+                "--no-color",
+            ]
         return {
             "dry_run": True,
             "task_id": tid,
@@ -1101,35 +1711,73 @@ def execute_single_task(
         worktree_path = str(wt)
         branch_name = br
 
-    cmd = build_codex_exec_cmd(
-        codex_bin=get_codex_bin(),  # type: ignore[arg-type]
-        workdir=workdir,
-        model=model_used,
-        effort=effort_used,
-        sandbox=sandbox,
-        network=network,
-        report_path=report_path,
-        is_git_repo=git_info["is_git_repo"],
-    )
-    rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
-        cmd, cwd=workdir, stdin_text=worker_prompt, timeout=timeout
-    )
-    (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
-    (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
-    parsed_events = parse_codex_events(stdout_text)
-    report = parse_report_file(
-        report_path,
-        parsed_events["last_agent_text"],
-        stderr_text,
-        rc,
-        event_errors=parsed_events["errors"],
-    )
-    session_id = parsed_events["session_id"]
-    usage = parsed_events["usage"]
+    desktop_synced = False
+    if backend == "codex":
+        cmd = build_codex_exec_cmd(
+            codex_bin=get_codex_bin(),  # type: ignore[arg-type]
+            workdir=workdir,
+            model=model_used,
+            effort=effort_used,
+            sandbox=sandbox,
+            network=network,
+            report_path=report_path,
+            is_git_repo=git_info["is_git_repo"],
+        )
+        rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
+            cmd, cwd=workdir, stdin_text=worker_prompt, timeout=timeout
+        )
+        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
+        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
+        parsed_events = parse_codex_events(stdout_text)
+        report = parse_report_file(
+            report_path,
+            parsed_events["last_agent_text"],
+            stderr_text,
+            rc,
+            event_errors=parsed_events["errors"],
+        )
+        session_id = parsed_events["session_id"]
+        usage = parsed_events["usage"]
+    else:
+        zmode = "plan" if sandbox == "read-only" else "build"
+        z_exec = run_zcode_with_failover(
+            node_bin=get_node_bin(),  # type: ignore[arg-type]
+            prompt_text=worker_prompt,
+            workdir=workdir,
+            zmode=zmode,
+            routing=routing,
+            run_dir=run_dir,
+            timeout=timeout,
+        )
+        rc = z_exec["rc"]
+        stdout_text = z_exec["stdout"]
+        stderr_text = z_exec["stderr"]
+        timed_out = z_exec["timed_out"]
+        model_used = z_exec["model_used"]
+        effort_used = z_exec["effort_used"]
+        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
+        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
+        z_parsed = parse_zcode_output(stdout_text, stderr_text, rc)
+        report = z_parsed["report"]
+        session_id = z_parsed["session_id"]
+        usage = z_parsed["usage"]
 
     git_truth = collect_git_truth(workdir, git_info["head_sha"])
     now = utc_now()
     final_status = "timed_out" if timed_out else report.get("status", "completed" if rc == 0 else "failed")
+
+    if backend == "zcode" and session_id:
+        desktop_synced = sync_zcode_session_to_desktop_index(
+            session_id=session_id,
+            workspace_path=Path(git_info["repo_root"]) if git_info.get("repo_root") else cwd,
+            title_hint=prompt,
+            model_full=model_used or "qwen-alibaba-model-studio-cn/kimi-k3",
+            effort=effort_used or "max",
+            sandbox=sandbox,
+            status=final_status,
+            summary_text=report.get("summary", ""),
+            worktree_root=worktree_path,
+        )
 
     task_record = {
         "task_id": tid,
@@ -1148,6 +1796,7 @@ def execute_single_task(
         "sandbox": sandbox,
         "network": network,
         "session_id": session_id,
+        "desktop_synced": desktop_synced,
         "status": final_status,
         "exit_code": rc,
         "created_at": now,
@@ -1171,6 +1820,7 @@ def execute_single_task(
         "workdir": str(workdir),
         "branch": branch_name,
         "session_id": session_id,
+        "desktop_synced": desktop_synced,
         "exit_code": rc,
         "timed_out": timed_out,
         "usage": usage,
@@ -1189,11 +1839,18 @@ def cmd_health(_args: argparse.Namespace) -> int:
     codex_bin = get_codex_bin()
     node_bin = get_node_bin()
     git_bin = get_git_bin()
+    zcode_exists = ZCODE_SCRIPT.exists()
 
     codex_ver = probe_version([codex_bin, "--version"]) if codex_bin else None
     node_ver = probe_version([node_bin, "--version"]) if node_bin else None
     git_ver = probe_version([git_bin, "--version"]) if git_bin else None
+    zcode_ver = (
+        probe_version([node_bin, str(ZCODE_SCRIPT), "--version"])
+        if (node_bin and zcode_exists)
+        else None
+    )
     frontier = discover_frontier_models()
+    zcode_models = discover_zcode_models()
 
     healthy = bool(
         codex_bin
@@ -1208,7 +1865,16 @@ def cmd_health(_args: argparse.Namespace) -> int:
         "state_dir": str(STATE_DIR),
         "default_quality_mode": "smart",
         "codex": {"bin": codex_bin, "version": codex_ver, "candidates": candidates},
-        "node": {"bin": node_bin, "version": node_ver},
+        "zcode": {
+            "node_bin": node_bin,
+            "node_version": node_ver,
+            "script": str(ZCODE_SCRIPT),
+            "script_exists": zcode_exists,
+            "version": zcode_ver,
+            "cli_db_exists": ZCODE_CLI_DB.exists(),
+            "tasks_index_db_exists": ZCODE_TASKS_INDEX_DB.exists(),
+            "providers": zcode_models.get("providers", []),
+        },
         "git": {"bin": git_bin, "version": git_ver},
         "frontier_models": {
             "exists": frontier["exists"],
@@ -1262,7 +1928,6 @@ def cmd_batch(args: argparse.Namespace) -> int:
         item_cwd = Path(item.get("cwd", default_cwd)).resolve()
         item_sandbox = item.get("sandbox", "workspace-write")
         item_iso = item.get("isolation", "auto")
-        # Enforce worktree isolation when multiple concurrent write tasks share a Git repo
         if len(items) > 1 and item_sandbox == "workspace-write" and item_iso == "auto":
             item_iso = "worktree"
         item_alt = item.get("alternate")
@@ -1317,10 +1982,12 @@ def cmd_resume(args: argparse.Namespace) -> int:
         if not task_record:
             raise ValueError(f"Unknown task_id: {args.task_id}")
 
-    backend = args.backend or (task_record["backend"] if task_record else "codex")
     session_id = args.session_id or (task_record["session_id"] if task_record else None)
     if not session_id:
         raise ValueError("No session_id available to resume (pass --session-id or valid --task-id).")
+
+    inferred_backend = "zcode" if session_id.startswith("sess_") else "codex"
+    backend = args.backend or (task_record["backend"] if task_record else inferred_backend)
 
     workdir = Path(args.cwd or (task_record["workdir"] if task_record else ".")).resolve()
     if not workdir.exists():
@@ -1370,7 +2037,20 @@ def cmd_resume(args: argparse.Namespace) -> int:
             model_used = routing["model"]
             effort_used = routing["effort"]
     else:
-        raise RuntimeError(f"Unsupported backend: {backend}")
+        node_bin = get_node_bin()
+        if not node_bin or not ZCODE_SCRIPT.exists():
+            raise RuntimeError("ZCode runtime not found")
+        inherited_model = args.model or (task_record.get("model") if task_record else None)
+        routing = resolve_zcode_model_and_fallbacks(
+            difficulty=args.difficulty,
+            prompt=prompt_text,
+            explicit_model=inherited_model,
+            explicit_effort=args.effort,
+            prefer_wide=args.prefer_wide,
+            is_review=False,
+        )
+        model_used = routing["model"]
+        effort_used = routing["effort"]
 
     resume_tid = args.task_id or make_task_id("resume")
     turn_id = make_task_id("turn")
@@ -1379,16 +2059,33 @@ def cmd_resume(args: argparse.Namespace) -> int:
     worker_prompt = build_worker_prompt(prompt_text, sandbox=sandbox, network=network, is_resume=True)
 
     if args.dry_run:
-        preview_cmd = build_codex_resume_cmd(
-            codex_bin=get_codex_bin() or "codex",
-            session_id=session_id,
-            model=model_used,
-            effort=effort_used,
-            sandbox=sandbox,
-            network=network,
-            report_path=report_path,
-            is_git_repo=git_info["is_git_repo"],
-        )
+        if backend == "codex":
+            preview_cmd = build_codex_resume_cmd(
+                codex_bin=get_codex_bin() or "codex",
+                session_id=session_id,
+                model=model_used,
+                effort=effort_used,
+                sandbox=sandbox,
+                network=network,
+                report_path=report_path,
+                is_git_repo=git_info["is_git_repo"],
+            )
+        else:
+            zmode = "plan" if sandbox == "read-only" else "build"
+            preview_cmd = [
+                get_node_bin() or "node",
+                str(ZCODE_SCRIPT),
+                "--resume",
+                session_id,
+                "-p",
+                "<prompt>",
+                "--cwd",
+                str(workdir),
+                "--mode",
+                zmode,
+                "--json",
+                "--no-color",
+            ]
         print(
             json.dumps(
                 {
@@ -1410,33 +2107,79 @@ def cmd_resume(args: argparse.Namespace) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.txt").write_text(worker_prompt, encoding="utf-8")
 
-    cmd = build_codex_resume_cmd(
-        codex_bin=get_codex_bin(),  # type: ignore[arg-type]
-        session_id=session_id,
-        model=model_used,
-        effort=effort_used,
-        sandbox=sandbox,
-        network=network,
-        report_path=report_path,
-        is_git_repo=git_info["is_git_repo"],
-    )
-    rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
-        cmd, cwd=workdir, stdin_text=worker_prompt, timeout=args.timeout
-    )
-    (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
-    (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
-    parsed_events = parse_codex_events(stdout_text)
-    report = parse_report_file(
-        report_path,
-        parsed_events["last_agent_text"],
-        stderr_text,
-        rc,
-        event_errors=parsed_events["errors"],
-    )
-    new_session_id = parsed_events["session_id"] or session_id
-    usage = parsed_events["usage"]
+    desktop_synced = False
+    if backend == "codex":
+        cmd = build_codex_resume_cmd(
+            codex_bin=get_codex_bin(),  # type: ignore[arg-type]
+            session_id=session_id,
+            model=model_used,
+            effort=effort_used,
+            sandbox=sandbox,
+            network=network,
+            report_path=report_path,
+            is_git_repo=git_info["is_git_repo"],
+        )
+        rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
+            cmd, cwd=workdir, stdin_text=worker_prompt, timeout=args.timeout
+        )
+        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
+        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
+        parsed_events = parse_codex_events(stdout_text)
+        report = parse_report_file(
+            report_path,
+            parsed_events["last_agent_text"],
+            stderr_text,
+            rc,
+            event_errors=parsed_events["errors"],
+        )
+        new_session_id = parsed_events["session_id"] or session_id
+        usage = parsed_events["usage"]
+    else:
+        zmode = "plan" if sandbox == "read-only" else "build"
+        z_exec = run_zcode_with_failover(
+            node_bin=get_node_bin(),  # type: ignore[arg-type]
+            prompt_text=worker_prompt,
+            workdir=workdir,
+            zmode=zmode,
+            routing=routing,
+            run_dir=run_dir,
+            timeout=args.timeout,
+            resume_session_id=session_id,
+        )
+        rc = z_exec["rc"]
+        stdout_text = z_exec["stdout"]
+        stderr_text = z_exec["stderr"]
+        timed_out = z_exec["timed_out"]
+        model_used = z_exec["model_used"]
+        effort_used = z_exec["effort_used"]
+        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
+        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
+        z_parsed = parse_zcode_output(stdout_text, stderr_text, rc)
+        report = z_parsed["report"]
+        new_session_id = z_parsed["session_id"] or session_id
+        usage = z_parsed["usage"]
 
     git_truth = collect_git_truth(workdir, base_sha)
+    final_status = "timed_out" if timed_out else report.get("status", "completed" if rc == 0 else "failed")
+
+    if backend == "zcode" and new_session_id:
+        ws_root = (
+            Path(task_record["repo_root"])
+            if (task_record and task_record.get("repo_root"))
+            else (Path(git_info["repo_root"]) if git_info.get("repo_root") else workdir)
+        )
+        desktop_synced = sync_zcode_session_to_desktop_index(
+            session_id=new_session_id,
+            workspace_path=ws_root,
+            title_hint=prompt_text,
+            model_full=model_used or "qwen-alibaba-model-studio-cn/kimi-k3",
+            effort=effort_used or "max",
+            sandbox=sandbox,
+            status=final_status,
+            summary_text=report.get("summary", ""),
+            worktree_root=task_record.get("worktree_path") if task_record else None,
+        )
+
     if task_record:
         with locked_state() as state:
             if resume_tid in state["tasks"]:
@@ -1445,9 +2188,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 state["tasks"][resume_tid]["sandbox"] = sandbox
                 state["tasks"][resume_tid]["network"] = network
                 state["tasks"][resume_tid]["session_id"] = new_session_id
-                state["tasks"][resume_tid]["status"] = (
-                    "timed_out" if timed_out else report.get("status", "completed" if rc == 0 else "failed")
-                )
+                state["tasks"][resume_tid]["desktop_synced"] = desktop_synced
+                state["tasks"][resume_tid]["status"] = final_status
                 state["tasks"][resume_tid]["updated_at"] = utc_now()
 
     result = {
@@ -1461,6 +2203,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         "network": network,
         "workdir": str(workdir),
         "session_id": new_session_id,
+        "desktop_synced": desktop_synced,
         "exit_code": rc,
         "timed_out": timed_out,
         "usage": usage,
@@ -1489,8 +2232,22 @@ def cmd_review(args: argparse.Namespace) -> int:
 
     base_sha = args.base or (task_record.get("base_sha") if task_record else None)
     git_truth = collect_git_truth(workdir, base_sha)
-    backend = args.backend
 
+    # Heterogeneous cross-engine review when --backend auto is used
+    author_backend = task_record.get("backend") if task_record else None
+    if args.backend == "auto":
+        if author_backend == "codex" and get_node_bin() and ZCODE_SCRIPT.exists():
+            backend = "zcode"
+        elif author_backend == "zcode" and get_codex_bin():
+            backend = "codex"
+        elif get_node_bin() and ZCODE_SCRIPT.exists():
+            backend = "zcode"
+        else:
+            backend = "codex"
+    else:
+        backend = args.backend
+
+    zcode_routing: dict[str, Any] | None = None
     if backend == "codex":
         codex_bin = get_codex_bin()
         if not codex_bin:
@@ -1519,40 +2276,74 @@ def cmd_review(args: argparse.Namespace) -> int:
             chain = ("max", "xhigh", "high") if args.quality == "max" else ("high", "xhigh", "medium")
             review_effort = pick_supported_effort(chain, effs)
     else:
-        raise RuntimeError(f"Unsupported backend: {backend}")
+        node_bin = get_node_bin()
+        if not node_bin or not ZCODE_SCRIPT.exists():
+            raise RuntimeError("ZCode runtime not found")
+        zcode_routing = resolve_zcode_model_and_fallbacks(
+            difficulty="hard",
+            prompt=args.prompt or "code review",
+            explicit_model=args.model,
+            explicit_effort=args.effort,
+            prefer_wide=False,
+            is_review=True,
+        )
+        review_model = zcode_routing["model"]
+        review_effort = zcode_routing["effort"]
 
     review_id = make_task_id("review")
     run_dir = RUNS_DIR / review_id
     review_out = run_dir / "review_output.txt"
 
-    cmd = [
-        get_codex_bin() or "codex",
-        "exec",
-        "review",
-    ]
-    if review_model:
-        cmd.extend(["-m", review_model])
-    if review_effort:
-        cmd.extend(["-c", f'model_reasoning_effort="{review_effort}"'])
-    cmd.extend([
-        "-c",
-        'sandbox_mode="read-only"',
-        "-c",
-        'approval_policy="never"',
-        "--json",
-        "-o",
-        str(review_out),
-    ])
-    if git_truth.get("has_new_commits") and base_sha and not args.uncommitted:
-        cmd.extend(["--base", base_sha])
+    review_prompt = args.prompt or (
+        "请对当前工作区相对基准提交 "
+        f"{base_sha or 'HEAD'} 的代码改动执行严格的只读异构代码审计（Code Review）。"
+        "重点排查：1) 会算错钱、丢数据、越权、发错消息或导致线上故障的严重问题（写清具体触发路径）；"
+        "2) 边界条件遗漏、并发/状态同步缺陷与未覆盖的测试；3) 给出明确结论（通过 / 需修复项）。"
+    )
+
+    if backend == "codex":
+        cmd = [
+            get_codex_bin() or "codex",
+            "exec",
+            "review",
+        ]
+        if review_model:
+            cmd.extend(["-m", review_model])
+        if review_effort:
+            cmd.extend(["-c", f'model_reasoning_effort="{review_effort}"'])
+        cmd.extend([
+            "-c",
+            'sandbox_mode="read-only"',
+            "-c",
+            'approval_policy="never"',
+            "--json",
+            "-o",
+            str(review_out),
+        ])
+        if git_truth.get("has_new_commits") and base_sha and not args.uncommitted:
+            cmd.extend(["--base", base_sha])
+        else:
+            cmd.append("--uncommitted")
+        if not git_truth.get("is_git"):
+            cmd.append("--skip-git-repo-check")
+        if args.prompt and not (base_sha or args.uncommitted):
+            cmd.append("-")
+            stdin_prompt = args.prompt
+        else:
+            stdin_prompt = None
     else:
-        cmd.append("--uncommitted")
-    if not git_truth.get("is_git"):
-        cmd.append("--skip-git-repo-check")
-    if args.prompt and not (base_sha or args.uncommitted):
-        cmd.append("-")
-        stdin_prompt = args.prompt
-    else:
+        cmd = [
+            get_node_bin() or "node",
+            str(ZCODE_SCRIPT),
+            "-p",
+            review_prompt,
+            "--cwd",
+            str(workdir),
+            "--mode",
+            "plan",
+            "--json",
+            "--no-color",
+        ]
         stdin_prompt = None
 
     if args.dry_run:
@@ -1562,8 +2353,10 @@ def cmd_review(args: argparse.Namespace) -> int:
                     "dry_run": True,
                     "review_id": review_id,
                     "backend": backend,
+                    "author_backend": author_backend,
                     "review_model": review_model,
                     "review_effort": review_effort,
+                    "routing": zcode_routing,
                     "workdir": str(workdir),
                     "command": cmd,
                 },
@@ -1574,27 +2367,92 @@ def cmd_review(args: argparse.Namespace) -> int:
         return 0
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
-        cmd, cwd=workdir, stdin_text=stdin_prompt, timeout=args.timeout
-    )
-    (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
-    (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
+    if backend == "codex":
+        rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
+            cmd, cwd=workdir, stdin_text=stdin_prompt, timeout=args.timeout
+        )
+        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
+        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
+        parsed_events = parse_codex_events(stdout_text)
+        review_text = (
+            review_out.read_text(encoding="utf-8", errors="replace").strip()
+            if review_out.exists()
+            else (parsed_events["last_agent_text"] or "\n".join(stderr_text.splitlines()[-20:]))
+        )
+        usage = parsed_events["usage"]
+        session_id = parsed_events["session_id"]
+    else:
+        assert zcode_routing is not None
+        z_exec = run_zcode_with_failover(
+            node_bin=get_node_bin(),  # type: ignore[arg-type]
+            prompt_text=review_prompt,
+            workdir=workdir,
+            zmode="plan",
+            routing=zcode_routing,
+            run_dir=run_dir,
+            timeout=args.timeout,
+        )
+        rc = z_exec["rc"]
+        stdout_text = z_exec["stdout"]
+        stderr_text = z_exec["stderr"]
+        timed_out = z_exec["timed_out"]
+        review_model = z_exec["model_used"]
+        review_effort = z_exec["effort_used"]
+        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
+        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
+        z_parsed = parse_zcode_output(stdout_text, stderr_text, rc)
+        review_text = z_parsed["report"]["summary"]
+        usage = z_parsed["usage"]
+        session_id = z_parsed["session_id"]
+        if session_id:
+            sync_zcode_session_to_desktop_index(
+                session_id=session_id,
+                workspace_path=workdir,
+                title_hint=f"[交叉代码审计] {args.task_id or workdir.name}",
+                model_full=review_model or "qwen-alibaba-model-studio-cn/deepseek-v4-pro-0813",
+                effort=review_effort or "max",
+                sandbox="read-only",
+                status="completed" if rc == 0 else "failed",
+                summary_text=review_text,
+            )
 
-    parsed_events = parse_codex_events(stdout_text)
-    review_text = (
-        review_out.read_text(encoding="utf-8", errors="replace").strip()
-        if review_out.exists()
-        else (parsed_events["last_agent_text"] or "\n".join(stderr_text.splitlines()[-20:]))
-    )
-    usage = parsed_events["usage"]
-    session_id = parsed_events["session_id"]
+    now = utc_now()
+    final_status = "timed_out" if timed_out else ("completed" if rc == 0 else "failed")
+    review_record = {
+        "task_id": review_id,
+        "backend": backend,
+        "model": review_model,
+        "effort": review_effort,
+        "difficulty": "hard",
+        "repo_root": str(workdir) if git_truth.get("is_git") else None,
+        "is_git_repo": bool(git_truth.get("is_git")),
+        "base_sha": base_sha,
+        "original_cwd": str(workdir),
+        "workdir": str(workdir),
+        "worktree_path": None,
+        "branch": None,
+        "isolation": "inplace",
+        "sandbox": "read-only",
+        "network": False,
+        "session_id": session_id,
+        "desktop_synced": bool(backend == "zcode" and session_id),
+        "status": final_status,
+        "exit_code": rc,
+        "created_at": now,
+        "updated_at": now,
+        "run_dir": str(run_dir),
+    }
+    with locked_state() as state:
+        state["tasks"][review_id] = review_record
 
     payload = {
         "review_id": review_id,
         "task_id": args.task_id,
         "backend": backend,
+        "author_backend": author_backend,
         "review_model": review_model,
         "review_effort": review_effort,
+        "routing": zcode_routing,
         "workdir": str(workdir),
         "session_id": session_id,
         "exit_code": rc,
@@ -1603,7 +2461,19 @@ def cmd_review(args: argparse.Namespace) -> int:
         "review_summary": review_text[:3000],
         "git_truth": git_truth,
         "run_dir": str(run_dir),
+        "report": {
+            "status": final_status,
+            "summary": review_text[:2000],
+            "files_modified": [],
+            "commands_run": [],
+            "verification_passed": rc == 0,
+            "risks_or_followups": [],
+            "notes_for_orchestrator": f"Heterogeneous code review via {backend} ({review_model})",
+        },
     }
+    (run_dir / "result.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0 if rc == 0 else 1
 
@@ -1629,6 +2499,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "status": rec.get("status"),
                     "isolation": rec.get("isolation"),
                     "branch": rec.get("branch"),
+                    "session_id": rec.get("session_id"),
+                    "desktop_synced": rec.get("desktop_synced", False),
                     "worktree_exists": bool(rec.get("worktree_path") and Path(rec["worktree_path"]).exists()),
                     "updated_at": rec.get("updated_at"),
                 }
@@ -1676,24 +2548,24 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Local multi-agent dispatcher (Antigravity Brain -> Codex CLI Hand)."
+        description="Local multi-agent dispatcher (Antigravity Brain -> Codex CLI & ZCode Hand)."
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
-    sub.add_parser("health", help="Check local Codex CLI, Git, Node, and model cache readiness.")
+    sub.add_parser("health", help="Check local Codex, ZCode, Git, and model cache readiness.")
 
     p_run = sub.add_parser(
         "run",
-        help="Dispatch one coding/analysis task. Defaults to smart quality-quota (--quality smart) dynamic frontier routing.",
+        help="Dispatch one coding/analysis task to Codex or ZCode with dynamic model routing.",
     )
     p_run.add_argument("--cwd", default=".", help="Target repository or working directory.")
     p_run.add_argument("--prompt", required=True, help="Task prompt or '-' for stdin.")
     p_run.add_argument("--backend", choices=VALID_BACKENDS, default="codex")
     p_run.add_argument("--difficulty", choices=VALID_DIFFICULTIES, default="auto")
     p_run.add_argument("--quality", choices=VALID_QUALITIES, default="smart", help="Quality/quota routing mode (default: smart).")
-    p_run.add_argument("--prefer-wide", action="store_true", help="Prefer largest-context frontier sibling for wide repo sweeps.")
-    p_run.add_argument("--model", default=None, help="Explicit model slug override (supports any future official slug).")
-    p_run.add_argument("--effort", default=None, help="Explicit Codex reasoning effort override.")
+    p_run.add_argument("--prefer-wide", action="store_true", help="Prefer largest-context model (gpt-6.2-sol 500k on Codex; glm-5.3 1M on ZCode).")
+    p_run.add_argument("--model", default=None, help="Explicit model slug override (supports Codex slugs or ZCode modelId / providerId/modelId).")
+    p_run.add_argument("--effort", default=None, help="Explicit reasoning effort override.")
     p_run.add_argument("--alternate", dest="alternate", action="store_true", default=None, help="Enable alternation across flagship/wide_fast on medium.")
     p_run.add_argument("--no-alternate", dest="alternate", action="store_false", help="Disable alternation on medium.")
     p_run.add_argument("--sandbox", choices=VALID_SANDBOXES, default="workspace-write")
@@ -1713,7 +2585,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument("--timeout", type=int, default=600)
     p_batch.add_argument("--dry-run", action="store_true")
 
-    p_res = sub.add_parser("resume", help="Continue an existing worker session in its workdir.")
+    p_res = sub.add_parser("resume", help="Continue an existing Codex or ZCode worker session in its workdir.")
     p_res.add_argument("--task-id", default=None)
     p_res.add_argument("--session-id", default=None)
     p_res.add_argument("--cwd", default=None)
@@ -1732,10 +2604,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_res.add_argument("--timeout", type=int, default=600)
     p_res.add_argument("--dry-run", action="store_true")
 
-    p_rev = sub.add_parser("review", help="Run non-interactive read-only Codex code review.")
+    p_rev = sub.add_parser("review", help="Run non-interactive read-only heterogeneous code review (--backend auto/codex/zcode).")
     p_rev.add_argument("--task-id", default=None)
     p_rev.add_argument("--cwd", default=None)
-    p_rev.add_argument("--backend", choices=VALID_BACKENDS, default="codex")
+    p_rev.add_argument("--backend", choices=VALID_REVIEW_BACKENDS, default="auto")
     p_rev.add_argument("--quality", choices=VALID_QUALITIES, default="smart")
     p_rev.add_argument("--model", default=None)
     p_rev.add_argument("--effort", default=None)

@@ -46,8 +46,8 @@ const PANE_META = {
   ui: { resourceUri: APP_URI },
   'com.google.antigravity/ui': {
     entrypoints: [
-      { type: 'aux_pane', title: 'Codex Console' },
-      { type: 'global', title: 'Codex Console' },
+      { type: 'aux_pane', title: 'Antigravity Lead Codex' },
+      { type: 'global', title: 'Antigravity Lead Codex' },
     ],
   },
 };
@@ -64,7 +64,7 @@ function readAppHtml() {
   const htmlPath = process.env.CODEX_CONSOLE_HTML || path.join(PLUGIN_ROOT, 'dist', 'app.html');
   if (!fs.existsSync(htmlPath)) {
     return `<!doctype html><html><body style="font-family:system-ui;padding:20px;background:#111318;color:#e5e7eb">
-      <h3>Codex Console UI 未构建</h3>
+      <h3>Antigravity Lead Codex UI 未构建</h3>
       <p>请运行 <code>npm run build:ui</code> 生成 ${htmlPath}</p>
     </body></html>`;
   }
@@ -88,7 +88,7 @@ function fail(message) {
 
 const server = new McpServer({
   name: 'codex-console',
-  version: '1.0.0',
+  version: '1.3.0',
 });
 
 // UI Resource
@@ -96,8 +96,8 @@ server.registerResource(
   'codex-console-app',
   APP_URI,
   {
-    title: 'Codex Console',
-    description: 'Antigravity 侧栏可视化 Codex 任务控制台',
+    title: 'Antigravity Lead Codex',
+    description: 'Antigravity 侧栏可视化 Codex + ZCode 双引擎任务控制台',
     mimeType: APP_MIME,
     _meta: { ui: { prefersBorder: false } },
   },
@@ -117,12 +117,12 @@ server.registerResource(
 server.registerTool(
   'open_codex_console',
   {
-    title: 'Codex Console',
+    title: 'Antigravity Lead Codex',
     description:
-      '打开 Antigravity 侧栏 Codex 可视化控制台，查看本地 Codex CLI / Desktop / Worktree 任务、Goal 状态、受管子代理与跨会话 Change 绑定，并支持只读诊断与排队唤醒。',
+      '打开 Antigravity 侧栏「Antigravity Lead Codex」双引擎可视化控制台，查看本地 Codex CLI / Desktop 与 ZCode 国模任务、隔离 Worktree 受管子代理与跨会话 Change 绑定，并支持只读诊断与排队唤醒。',
     inputSchema: {
       tab: z.enum(['tasks', 'subagents', 'collab']).optional().describe('初始激活页签'),
-      threadId: z.string().optional().describe('默认聚焦的 Codex 会话 ID'),
+      threadId: z.string().optional().describe('默认聚焦的 Codex 或 ZCode 会话 ID'),
       query: z.string().optional().describe('初始搜索关键字'),
     },
     _meta: PANE_META,
@@ -130,8 +130,9 @@ server.registerTool(
   async (args = {}) => {
     const snap = store.getSnapshot({ limit: 80 });
     const summaryText =
-      `Codex Console 已连接（总会话 ${snap.stats.totalThreads}，已加载 ${snap.stats.loadedThreads}，` +
-      `CLI Exec ${snap.stats.execCount}，运行中 ${snap.stats.runningCount}，` +
+      `Antigravity Lead Codex 已连接（总会话 ${snap.stats.totalThreads}，已加载 ${snap.stats.loadedThreads}，` +
+      `Codex ${snap.stats.codexCount || 0}，ZCode ${snap.stats.zcodeCount || 0}，` +
+      `反重力派发 ${snap.stats.agyCount}，运行中 ${snap.stats.runningCount}，` +
       `Goal 阻塞 ${snap.stats.goalBlockedCount}，受管子代理 ${snap.stats.managedCount}，` +
       `跨会话绑定 ${snap.stats.collabCount}）。`;
 
@@ -150,13 +151,14 @@ server.registerTool(
 server.registerTool(
   'list_codex_tasks',
   {
-    title: '列出 Codex 任务',
-    description: '查询本地 Codex CLI/Desktop/Worktree 会话、Goal 阻塞状态与受管子代理清单。',
+    title: '列出 Codex 与 ZCode 任务',
+    description: '查询本地 Codex CLI/Desktop 与 ZCode 国模会话、Goal 阻塞状态与受管子代理清单。',
     inputSchema: {
       query: z.string().optional().describe('按任务名、项目、分支或路径搜索'),
+      engine: z.enum(['all', 'codex', 'zcode']).optional().describe('按引擎过滤：all/codex/zcode'),
       project: z.string().optional().describe('按项目名过滤'),
       status: z.string().optional().describe('状态过滤：running/blocked/goal_active/exec_done/failed/archived'),
-      onlyExec: z.boolean().optional().describe('仅看 CLI Exec / Worktree 派发任务'),
+      onlyExec: z.boolean().optional().describe('仅看反重力 CLI / Worktree 派发任务'),
       includeSubagents: z.boolean().optional().describe('是否包含子代理线程'),
       limit: z.number().int().min(1).max(200).optional().describe('返回条数上限，默认 40'),
     },
@@ -168,8 +170,11 @@ server.registerTool(
     if (!args.includeSubagents) {
       list = list.filter((t) => !t.isSubagent);
     }
+    if (args.engine && args.engine !== 'all') {
+      list = list.filter((t) => t.engine === args.engine);
+    }
     if (args.onlyExec) {
-      list = list.filter((t) => t.isExec);
+      list = list.filter((t) => t.isExec || t.isAgyDispatched);
     }
     if (args.project) {
       list = list.filter((t) => t.projectName === args.project);
@@ -180,7 +185,7 @@ server.registerTool(
     if (args.query) {
       const q = args.query.toLowerCase();
       list = list.filter((t) =>
-        `${t.title} ${t.projectName} ${t.branch} ${t.cwd} ${t.goal?.objective || ''} ${t.id}`
+        `${t.title} ${t.projectName} ${t.branch} ${t.cwd} ${t.goal?.objective || ''} ${t.id} ${t.engineLabel || ''} ${t.model || ''}`
           .toLowerCase()
           .includes(q)
       );
@@ -188,10 +193,10 @@ server.registerTool(
     const sliced = list.slice(0, args.limit || 40);
     const lines = sliced.map(
       (t) =>
-        `- [${t.status.label}] ${t.title} (${t.shortId}) | 项目:${t.projectName} | 分支:${t.branch || '-'} | 模型:${t.model || '-'} | tokens:${t.tokensUsed}`
+        `- [${t.engineLabel || 'Codex'}｜${t.status.label}] ${t.title} (${t.shortId}) | 项目:${t.projectName} | 分支:${t.branch || '-'} | 模型:${t.model || '-'} | tokens:${t.tokensUsed}`
     );
     return ok(
-      `共匹配 ${list.length} 条 Codex 任务（展示前 ${sliced.length} 条）：\n${lines.join('\n')}`,
+      `共匹配 ${list.length} 条任务（展示前 ${sliced.length} 条）：\n${lines.join('\n')}`,
       { stats: snap.stats, totalMatched: list.length, tasks: sliced }
     );
   }
@@ -201,24 +206,26 @@ server.registerTool(
 server.registerTool(
   'get_codex_task_detail',
   {
-    title: '获取 Codex 任务详情',
-    description: '获取指定 Codex 会话的 Goal 状态、最近对话记录、排队消息、控制台诊断记录与跨会话绑定。',
+    title: '获取任务详情',
+    description: '获取指定 Codex 或 ZCode 会话的 Goal 状态、最近对话记录、排队消息、控制台诊断记录与跨会话绑定。',
     inputSchema: {
-      threadId: z.string().min(4).describe('Codex 会话 UUID 或前 8 位短 ID'),
+      threadId: z.string().min(4).describe('Codex 会话 UUID、ZCode sess_ ID 或前 8 位短 ID'),
     },
     _meta: BOTH_META,
   },
   async ({ threadId }) => {
     const snap = store.getSnapshot({ limit: 250 });
-    const match = snap.tasks.find((t) => t.id === threadId || t.id.startsWith(threadId));
+    const match = snap.tasks.find(
+      (t) => t.id === threadId || t.id.startsWith(threadId) || t.shortId === threadId
+    );
     const resolvedId = match ? match.id : threadId;
     const detail = store.getThreadDetail(resolvedId);
     if (!detail.task) {
-      return fail(`未找到 Codex 会话: ${threadId}`);
+      return fail(`未找到会话: ${threadId}`);
     }
     const git = await runner.inspectGit(detail.task.cwd);
     const summary =
-      `会话 ${detail.task.title} (${detail.task.shortId})\n` +
+      `会话 [${detail.task.engineLabel || 'Codex'}] ${detail.task.title} (${detail.task.shortId})\n` +
       `状态: ${detail.task.status.label} | 项目: ${detail.task.projectName} | 目录: ${detail.task.cwd}\n` +
       `分支: ${detail.task.branch || '-'} | 模型: ${detail.task.model || '-'} | Tokens: ${detail.task.tokensUsed}\n` +
       `最近消息数: ${detail.messages.length} | 控制台操作数: ${detail.ops.length} | 绑定数: ${detail.bindings.length}`;
@@ -232,9 +239,9 @@ server.registerTool(
   {
     title: '只读提问 / 一键诊断卡点',
     description:
-      '基于 codex exec fork --ephemeral（严格只读沙箱）对目标 Codex 会话执行非侵入式提问或一键诊断卡点，不污染原对话上下文且不修改工作区文件。',
+      '对目标 Codex 或 ZCode 会话执行非侵入式只读提问或一键诊断卡点（Codex 走 fork --ephemeral read-only，ZCode 走 --resume --mode plan），不修改工作区文件。',
     inputSchema: {
-      threadId: z.string().min(4).describe('目标 Codex 会话 UUID'),
+      threadId: z.string().min(4).describe('目标 Codex 或 ZCode 会话 ID'),
       prompt: z.string().optional().describe('自定义只读提问内容；留空则使用默认卡点诊断模板'),
       preset: z.enum(['diagnose_blocker', 'custom']).optional().describe('diagnose_blocker 为一键诊断卡点'),
     },
@@ -242,8 +249,10 @@ server.registerTool(
   },
   async ({ threadId, prompt, preset }) => {
     const snap = store.getSnapshot({ limit: 250 });
-    const match = snap.tasks.find((t) => t.id === threadId || t.id.startsWith(threadId));
-    if (!match) return fail(`未找到目标 Codex 会话: ${threadId}`);
+    const match = snap.tasks.find(
+      (t) => t.id === threadId || t.id.startsWith(threadId) || t.shortId === threadId
+    );
+    if (!match) return fail(`未找到目标会话: ${threadId}`);
 
     const isDiagnose = preset === 'diagnose_blocker' || !prompt?.trim();
     const op = runner.startReadonlyAsk({
@@ -251,10 +260,11 @@ server.registerTool(
       prompt: isDiagnose ? DIAGNOSE_BLOCKER_PROMPT : prompt,
       cwd: match.cwd,
       opType: isDiagnose ? 'diagnose_blocker' : 'readonly_ask',
+      engine: match.engine,
     });
 
     return ok(
-      `已启动只读${isDiagnose ? '卡点诊断' : '提问'}（操作ID: ${op.id}，目标会话: ${match.title} [${match.shortId}]）。请稍后在控制台或通过 console_get_op 查看结果。`,
+      `已启动只读${isDiagnose ? '卡点诊断' : '提问'}（操作ID: ${op.id}，目标会话: [${match.engineLabel}] ${match.title} [${match.shortId}]）。请稍后在控制台或通过 console_get_op 查看结果。`,
       { op }
     );
   }
@@ -264,10 +274,11 @@ server.registerTool(
 server.registerTool(
   'send_codex_message',
   {
-    title: '向 Codex 会话发送消息',
-    description: '向指定 Codex 会话投递指令，支持排队唤醒（codex queue --resume）、同步续跑（codex exec resume）、dispatch.py 续跑或只读提问。',
+    title: '向 Codex 或 ZCode 会话发送消息',
+    description:
+      '向指定 Codex 或 ZCode 会话投递指令，支持排队唤醒（codex queue --resume）、同步续跑（codex exec resume / zcode --resume）、dispatch.py 续跑或只读提问。',
     inputSchema: {
-      threadId: z.string().min(4).describe('目标 Codex 会话 UUID'),
+      threadId: z.string().min(4).describe('目标 Codex 或 ZCode 会话 ID'),
       message: z.string().min(1).describe('要发送的消息或执行指令'),
       mode: z.enum(['queue', 'resume', 'dispatch_resume', 'readonly']).optional().describe('默认 queue'),
       allowDuplicate: z.boolean().optional().describe('是否允许 60 秒内重复投递同一条消息'),
@@ -276,8 +287,10 @@ server.registerTool(
   },
   async ({ threadId, message, mode = 'queue', allowDuplicate = false }) => {
     const snap = store.getSnapshot({ limit: 250 });
-    const match = snap.tasks.find((t) => t.id === threadId || t.id.startsWith(threadId));
-    if (!match) return fail(`未找到目标 Codex 会话: ${threadId}`);
+    const match = snap.tasks.find(
+      (t) => t.id === threadId || t.id.startsWith(threadId) || t.shortId === threadId
+    );
+    if (!match) return fail(`未找到目标会话: ${threadId}`);
 
     try {
       const op = await runner.sendMessage({
@@ -287,9 +300,10 @@ server.registerTool(
         cwd: match.cwd,
         allowDuplicate,
         taskId: match.dispatchTask?.taskId || null,
+        engine: match.engine,
       });
       return ok(
-        `消息操作已提交（模式: ${mode}，状态: ${op.status}，操作ID: ${op.id}）${op.errorText ? `\n说明: ${op.errorText}` : ''}`,
+        `消息操作已提交（引擎: ${match.engineLabel}，模式: ${mode}，状态: ${op.status}，操作ID: ${op.id}）${op.errorText ? `\n说明: ${op.errorText}` : ''}`,
         { op }
       );
     } catch (err) {
@@ -302,11 +316,14 @@ server.registerTool(
 server.registerTool(
   'spawn_codex_worker',
   {
-    title: '新建受管 Codex 子代理',
-    description: '通过 multi-agent-dispatch (dispatch.py run) 在隔离 Git Worktree 中启动新的 Codex 子代理任务，并可选写入跨会话 Change 绑定。',
+    title: '新建受管 Codex / ZCode 子代理',
+    description:
+      '通过 multi-agent-dispatch (dispatch.py run) 在隔离 Git Worktree 中启动新的 Codex 或 ZCode 子代理任务，并可选写入跨会话 Change 绑定。',
     inputSchema: {
       cwd: z.string().min(1).describe('目标仓库或工作目录绝对路径'),
-      prompt: z.string().min(1).describe('给 Codex 子代理的清晰任务指令'),
+      prompt: z.string().min(1).describe('给子代理的清晰任务指令'),
+      backend: z.enum(['codex', 'zcode']).optional().describe('执行引擎：codex 或 zcode（默认 codex）'),
+      model: z.string().optional().describe('可选模型覆盖（如 gpt-6.2-astra / kimi-k3 / deepseek-v4-pro-0813 / glm-5.3）'),
       taskId: z.string().optional().describe('可选自定义 task_id'),
       difficulty: z.enum(['auto', 'low', 'medium', 'hard', 'extreme']).optional(),
       quality: z.enum(['smart', 'max', 'balanced']).optional(),
@@ -320,8 +337,9 @@ server.registerTool(
   async (args) => {
     try {
       const op = runner.spawnWorker(args);
+      const engineLabel = args.backend === 'zcode' ? 'ZCode' : 'Codex';
       return ok(
-        `已启动受管 Codex 子代理任务（操作ID: ${op.id}，目录: ${args.cwd}，策略: ${args.quality || 'smart'}/${args.difficulty || 'auto'}/${args.isolation || 'worktree'}${args.network ? '/network' : ''}）。`,
+        `已启动受管 ${engineLabel} 子代理任务（操作ID: ${op.id}，目录: ${args.cwd}，策略: ${args.backend || 'codex'}/${args.quality || 'smart'}/${args.difficulty || 'auto'}/${args.isolation || 'worktree'}${args.network ? '/network' : ''}）。`,
         { op }
       );
     } catch (err) {
@@ -334,17 +352,17 @@ server.registerTool(
 server.registerTool(
   'manage_collab_binding',
   {
-    title: '管理跨会话 Change ↔ Codex 绑定',
+    title: '管理跨会话 Change ↔ 会话绑定',
     description:
-      '维护 SQLite 跨会话协作中间件：记录 OpenSpec Change / BLACKBOARD 任务与 Codex 会话 ID 的绑定关系、责任边界（antigravity vs codex）与交接日志。',
+      '维护 SQLite 跨会话协作中间件：记录 OpenSpec Change / BLACKBOARD 任务与 Codex / ZCode 会话 ID 的绑定关系、责任边界（antigravity vs codex vs zcode）与交接日志。',
     inputSchema: {
       action: z.enum(['list', 'upsert', 'delete', 'log_message']),
       id: z.string().optional().describe('绑定记录 ID（删除/更新/写日志时使用）'),
-      changeKey: z.string().optional().describe('Change / 任务标识，如 feat-codex-console'),
+      changeKey: z.string().optional().describe('Change / 任务标识，如 feat-zcode-router'),
       goalTitle: z.string().optional().describe('目标描述'),
-      threadId: z.string().optional().describe('绑定的 Codex thread_id'),
+      threadId: z.string().optional().describe('绑定的 Codex thread_id 或 ZCode sess_id'),
       taskId: z.string().optional().describe('绑定的 dispatch task_id'),
-      ownerRole: z.enum(['codex', 'antigravity', 'shared']).optional().describe('责任归属'),
+      ownerRole: z.enum(['codex', 'zcode', 'antigravity', 'shared']).optional().describe('责任归属'),
       status: z.enum(['active', 'blocked', 'reviewing', 'completed', 'archived']).optional(),
       repoPath: z.string().optional(),
       branch: z.string().optional(),
@@ -439,7 +457,7 @@ server.registerTool(
   'console_toggle_pin',
   {
     title: 'Toggle Pin / Hide / Rename Thread',
-    description: '置顶、软隐藏或设置任务别名（保存在控制台自有 SQLite，不修改 Codex 原库）',
+    description: '置顶、软隐藏或设置任务别名（保存在控制台自有 SQLite，不修改原库）',
     inputSchema: {
       threadId: z.string().min(4),
       pinned: z.boolean().optional(),
@@ -493,6 +511,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('[codex-console] fatal error:', err);
+  console.error('[antigravity-lead-codex] fatal error:', err);
   process.exit(1);
 });

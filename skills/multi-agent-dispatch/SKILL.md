@@ -1,104 +1,78 @@
 ---
 name: multi-agent-dispatch
 description: >-
-  Delegate coding, refactoring, debugging, review, local document/media
-  workflows, or opt-in networked CLI/MCP tasks from Google Antigravity (Brain)
-  to local OpenAI Codex CLI (Hand), dynamically routing newest official frontier
-  models with default --quality smart via isolated Git worktrees, Blackboard
-  sync, confirmation gates, and compact JSON reports.
+  Use this skill when delegating coding, refactoring, debugging, cross-engine
+  code review, large-context sweeps, or opt-in networked CLI/MCP tasks from
+  Google Antigravity (Brain) to local OpenAI Codex CLI (GPT-6.2) and ZCode CLI
+  (Alibaba Bailian + Tencent TokenHub national flagships: deepseek-v4-pro-0813,
+  kimi-k3, glm-5.3 1M context, qwen3.8-max) via isolated Git worktrees,
+  automatic failover, ZCode Desktop index sync, and compact JSON reports.
 ---
 
-# Multi-Agent Dispatch (`Antigravity Brain ↔ Codex CLI Hand`)
+# Multi-Agent Dispatch (`Antigravity Brain ↔ Codex 20x & ZCode Flagships`)
 
-Use [dispatch.py](./scripts/dispatch.py) for the **Brain → Gate → Blackboard → Hand → Audit** loop.
+Use [dispatch.py](./scripts/dispatch.py) for the **Brain → Blackboard → Dual-Engine Hand → Heterogeneous Cross-Review → Brain Final Audit** loop.
 
-## Capability Tiers & Scenario Routing
+## 1. Dual-Engine Division of Labor (Max Effectiveness, Cost-Unconstrained)
 
-| Tier | Mode / Flag | Supported Scenarios | Confirmation Gate |
+| Engine | Flagship Models | Best-Fit Scenarios |
+| :--- | :--- | :--- |
+| **Antigravity (Brain)** | Gemini Ultra 5x | Requirement clarification (`/grill-me`), architecture decisions, frontend/UI visual & animation polish, <=50-line edits, live browser (`chrome-devtools`) & API end-to-end verification, merge & release. |
+| **Codex CLI (`--backend codex`)** | `gpt-6.2-astra` (272k), `gpt-6.2-sol` (500k) | Deep backend architecture, complex concurrency/state-machine debugging, OS kernel-level `workspace-write` sandboxed execution, and cross-reviewing ZCode changes. |
+| **ZCode CLI (`--backend zcode`)** | Dual-channel (`阿里云百炼` + `腾讯TokenHub`): `deepseek-v4-pro-0813`, `kimi-k3`, `glm-5.3` (1M context), `qwen3.8-max`, `deepseek-v4.1-flash` | 1M ultra-wide repo sweeps (`--prefer-wide` / `>=10` files -> `glm-5.3`), Chinese business logic & security analysis (`kimi-k3`), multi-module code & unit test generation (`deepseek-v4-pro-0813`), Lark/Feishu & office plugin workflows (`qwen3.8-max`), and cross-reviewing Codex changes. |
+
+## 2. ZCode Benchmark-Verified Routing & 3-Tier Cross-Provider Failover
+
+`dispatch.py` dynamically generates an isolated `run_dir/provider_config.json` per run (injected via `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`) with `reasoningLevel: "max"` (or `"xhigh"` on `qwen3.8-max`), and automatically fails over across providers if a channel times out or errors:
+
+| Scenario / Flag | Primary Selection | 1st Failover (Hot Backup) | 2nd Failover (Heterogeneous Backup) |
 | :--- | :--- | :--- | :--- |
-| **Tier 1 (Default Offline)** | `dispatch.py run` (`workspace-write`, offline, Git worktree) | Multi-file coding, refactoring, debugging, tests, scripts, repo review, local Office/PDF generation (`documents` / `spreadsheets` / `presentations` / `pdf` plugins & `~/.codex/skills/`). Built-in web search (`web__run`) and image gen (`image_gen`) also work in `codex exec`. | Present 3–6 line plan (waived only if user explicitly authorized direct execution). |
-| **Tier 2 (Networked & MCP-Extended)** | `dispatch.py run --network` and/or Codex MCP/Plugins | Outbound HTTPS / authenticated CLIs (`gh`, SaaS/cloud CLIs, `npm`/`pip`, Keychain-backed CLIs); headless browser automation via `codex mcp add chrome-devtools` / `playwright-mcp`; cloud SaaS connectors via `codex plugin add` (GitHub, Figma, Gmail, Linear, Slack, etc.). `--network` sets `sandbox_workspace_write.network_access=true` while **keeping filesystem isolation outside workdir** (never `danger-full-access`). | **Mandatory confirmation** before `--network` or any external write/mutation (even when direct execution was requested). |
-| **Tier 3 (Brain or Codex Desktop)** | Do NOT force via `dispatch.py` | `/grill-me`, architecture design, tiny 1-file edits (<= 20 lines), `docs/BLACKBOARD.md`, final diff/test audit, operating the user's already-logged-in Chrome window (without dedicated CDP `--browserUrl`), or Desktop GUI (`cua_repl` requires Codex Desktop Electron IPC pipe and fails in headless `codex exec`). | On explicit Codex dispatch requests, stop within <= 3 read-only checks and present Option A (Antigravity) vs Option B (Codex setup/Desktop). |
+| **Code Impl / Debug / Audit (`hard` / `review`)** | `阿里云百炼 / kimi-k3 (max)` | `阿里云百炼 / deepseek-v4-pro-0813 (max)` | `腾讯TokenHub / deepseek-v4-pro-0813 (max)` |
+| **Business Logic / Architecture / Security (`medium` / `extreme`)** | `阿里云百炼 / kimi-k3 (max)` | `腾讯TokenHub / kimi-k3 (max)` | `阿里云百炼 / qwen3.8-max (xhigh)` |
+| **1M Wide Context Sweep (`--prefer-wide` or `>=10` files)** | `腾讯TokenHub / glm-5.3 (max, 1M window)` | `阿里云百炼 / kimi-k3 (max)` | `阿里云百炼 / deepseek-v4-pro-0813 (max)` |
+| **Plugin / Fast Tool Task (`low`)** | `阿里云百炼 / qwen3.8-max (xhigh)` | `腾讯TokenHub / deepseek-v4.1-flash (max)` | `阿里云百炼 / kimi-k3 (max)` |
 
-## Extending Codex CLI ("Hand") Capabilities
+Every completed ZCode CLI task is also automatically synced into `~/.zcode/v2/tasks-index.sqlite` so it appears in both Antigravity's right side-pane (`Antigravity Lead Codex`) and `ZCode.app` Desktop's left task list.
 
-Headless `codex exec` inherits MCP servers, plugins, and skills from `~/.codex/`:
-1. **Standard MCP Servers** (run outside the shell sandbox):
-   - Headless Chrome automation: `codex mcp add chrome-devtools -- npx -y chrome-devtools-mcp@latest --headless --isolated`
-   - Connect to an explicitly started debug Chrome: `codex mcp add chrome-cdp -- npx -y chrome-devtools-mcp@latest --browserUrl http://127.0.0.1:9222`
-   - Playwright / DB / SaaS MCPs: `codex mcp add <name> -- <command...>` or `codex mcp add <name> --url <https://...>`
-2. **Official Plugins & Connectors**: `codex plugin list` and `codex plugin add <plugin-name>` (Office/PDF runtime plugins, GitHub, Figma, Gmail, Linear, Slack, Google Drive, etc.).
-3. **Local Skills**: drop `SKILL.md` bundles into `~/.codex/skills/`.
-4. **Networked CLI Sandbox**: pass `--network` to `dispatch.py run|batch|resume` to allow outbound HTTPS and Keychain-backed CLIs while blocking writes outside the workdir.
+## 3. Heterogeneous Cross-Engine Code Review (`dispatch.py review --backend auto`)
 
-## Blackboard Sync & Quota-Saving Rules
+Never let a model review its own code:
+- `dispatch.py review --task-id <id> --backend auto` (default) inspects the author task's `backend`:
+  - If authored by **Codex**, it automatically routes the static code review to **ZCode** (`deepseek-v4-pro-0813` at `max` reasoning);
+  - If authored by **ZCode**, it automatically routes the static code review to **Codex** (`gpt-6.2-astra` at `high`/`max` reasoning).
+- For core files touching money, auth/permissions, or outbound messaging, run both engines at maximum reasoning depth, followed by Antigravity's live browser/API verification.
 
-1. **Shared Blackboard (`docs/BLACKBOARD.md`)**: For Git repos, write confirmed goals, constraints, and task acceptance criteria to `docs/BLACKBOARD.md` and commit locally so Worktrees inherit complete context from `HEAD`. For non-Git operational folders, declare `--isolation inplace` in the plan rather than silently running `git init`.
-2. **Coarse-grained single-turn tasks**: Instruct Codex inside its prompt to read `docs/BLACKBOARD.md`, implement changes, **and run tests/linters/typechecks itself** before returning.
-3. **Structured short reports**: `dispatch.py` passes [report_schema.json](./resources/report_schema.json) and collects `git status --short` / `git diff --stat`, keeping Antigravity context clean and compact.
-4. **Worktree isolation & human gates**:
-   - Git write tasks default to `--isolation worktree` (`agy-worker/<task_id>`).
-   - **NEVER auto-merge** worker branches, **NEVER pass `--network`** without confirmation, and **NEVER push to GitHub** without explicit user approval.
-5. **Brain-driven iteration**: Review each report in Antigravity, decide the next prompt, and use `resume --task-id <id>` (reusing the Worktree, session, and `network` setting) or launch the next `run`.
+## 4. Command Reference
 
-## Dynamic Frontier Discovery & Smart Quality-Quota Routing (`--quality smart` Default)
-
-`dispatch.py` dynamically reads `~/.codex/models_cache.json`, identifies the newest official generation's **flagship** and **wide_fast** siblings, and calibrates reasoning effort against `supported_reasoning_levels`:
-
-| `--difficulty` | `--quality smart` (**Default**) | `--quality max` | `--quality balanced` |
-| :--- | :--- | :--- | :--- |
-| `low` | `wide_fast` + `medium` | `flagship` + `high` | `wide_fast` + `medium` |
-| `medium` | Alternates `wide_fast` ↔ `flagship` at `high` | `flagship` + `xhigh` | Alternates `wide_fast (high)` ↔ `flagship (medium)` |
-| `hard` | `flagship` + `xhigh` | `flagship` + `max` | `flagship` + `high` |
-| `extreme` | `flagship` + `max` | `flagship` + `ultra` | `flagship` + `xhigh` |
-| `auto` (default) | Heuristic classifier -> tier above | Heuristic classifier -> tier above | Heuristic classifier |
-
-- Pass `--prefer-wide` (or `>=10` `--files` under `auto`) to route large-context sweeps to `wide_fast`.
-- Pass `--model` / `--effort` anytime to override explicitly.
-
-## Command Reference
-
-Run via `python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py <subcommand>`:
-
-1. **Preflight health & frontier model discovery check**:
+1. **Health & dual-engine model discovery**:
    ```bash
    python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py health
    ```
-2. **Single task dispatch** (offline by default; add `--network` only after Gate 2 confirmation):
+2. **Dispatch to Codex or ZCode**:
    ```bash
+   # Codex flagship dispatch
    python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py run \
      --cwd /path/to/repo \
+     --backend codex \
      --difficulty auto \
-     --prompt "Read docs/BLACKBOARD.md, implement task X with unit tests, and run tests to verify."
-   ```
-   Networked CLI / API example (preserves filesystem sandbox outside workdir):
-   ```bash
+     --prompt "Read docs/BLACKBOARD.md, implement module X, and run tests."
+
+   # ZCode flagship dispatch (auto-selects Bailian/TokenHub flagship + syncs to ZCode Desktop)
    python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py run \
-     --cwd /path/to/workspace \
-     --isolation inplace \
-     --network \
-     --prompt "Run read-only API audit and output structured summary."
-   ```
-3. **Parallel batch dispatch** (supports `--network` default or per-item `"network": true`):
-   ```bash
-   python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py batch \
      --cwd /path/to/repo \
-     --max-concurrency 3 \
-     --manifest /path/to/tasks.json
+     --backend zcode \
+     --difficulty auto \
+     --prompt "Read docs/BLACKBOARD.md, implement module Y with unit tests, and run tests."
    ```
-4. **Resume an existing worker session** (inherits original `network` setting; override with `--network` / `--no-network`):
+3. **Heterogeneous cross-engine code review (`--backend auto` default)**:
+   ```bash
+   python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py review \
+     --task-id <task_id> \
+     --backend auto
+   ```
+4. **Resume an existing Codex or ZCode session**:
    ```bash
    python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py resume \
      --task-id <task_id> \
-     --prompt "Fix edge case noted in audit and re-run tests."
-   ```
-5. **Read-only code review**:
-   ```bash
-   python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py review \
-     --task-id <task_id>
-   ```
-6. **Inspect state & clean up worktree after user approves/merges**:
-   ```bash
-   python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py status
-   python3 ~/.gemini/config/skills/multi-agent-dispatch/scripts/dispatch.py cleanup --task-id <task_id> --delete-branch
+     --prompt "Fix edge case noted in cross-review and re-run tests."
    ```

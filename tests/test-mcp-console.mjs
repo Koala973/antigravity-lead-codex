@@ -11,9 +11,14 @@ const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
 const LAUNCHER = path.join(ROOT, 'plugins', 'codex-console', 'bin', 'run-server.sh');
 
-function createSyntheticCodexHome(codexHome, dispatchDir) {
+function createSyntheticCodexHome(codexHome, zcodeHome, dispatchDir) {
   fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(path.join(zcodeHome, 'cli', 'db'), { recursive: true });
+  fs.mkdirSync(path.join(zcodeHome, 'v2'), { recursive: true });
   fs.mkdirSync(path.join(dispatchDir, 'runs', 'demo-task-1', 'turn-20261124-010000-abc123'), {
+    recursive: true,
+  });
+  fs.mkdirSync(path.join(dispatchDir, 'runs', 'demo-zcode-1'), {
     recursive: true,
   });
 
@@ -221,21 +226,116 @@ function createSyntheticCodexHome(codexHome, dispatchDir) {
       },
     })
   );
+
+  // 7. Synthetic ZCode tasks-index.sqlite + cli/db/db.sqlite
+  const zIdxDb = new DatabaseSync(path.join(zcodeHome, 'v2', 'tasks-index.sqlite'));
+  zIdxDb.exec(`
+    CREATE TABLE projects (project_id TEXT PRIMARY KEY, name TEXT, deleted INTEGER);
+    CREATE TABLE project_roots (project_id TEXT, root_path TEXT);
+    CREATE TABLE tasks (
+      workspace_path TEXT, task_id TEXT, title TEXT, cli_title TEXT,
+      task_status TEXT, mode TEXT, model TEXT, created_at INTEGER, updated_at INTEGER,
+      pinned INTEGER, archived INTEGER, deleted INTEGER, cli_deleted INTEGER,
+      searchable_text TEXT, project_id TEXT, root_path TEXT, worktree_root TEXT
+    );
+  `);
+  zIdxDb.prepare(`INSERT INTO projects VALUES ('zproj-1', 'Security Audit Demo', 0)`).run();
+  zIdxDb.prepare(`INSERT INTO project_roots VALUES ('zproj-1', '/tmp/sec-audit')`).run();
+  zIdxDb
+    .prepare(
+      `INSERT INTO tasks VALUES (
+        '/tmp/sec-audit', 'sess_zcode_demo_001', '提取图片中的问题描述', '提取图片中的问题描述',
+        'completed', 'build', 'qwen-alibaba-model-studio-cn/kimi-k3', ?, ?,
+        0, 0, 0, 0, '提取下群的内容\n操作日志接口越权读取仍存在', 'zproj-1', '/tmp/sec-audit', NULL
+      )`
+    )
+    .run(nowMs - 400000, nowMs - 100000);
+  zIdxDb.close();
+
+  const zCliDb = new DatabaseSync(path.join(zcodeHome, 'cli', 'db', 'db.sqlite'));
+  zCliDb.exec(`
+    CREATE TABLE session (
+      id TEXT PRIMARY KEY, directory TEXT, path TEXT, title TEXT,
+      time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+      time_deleted INTEGER, last_outcome TEXT
+    );
+    CREATE TABLE message (
+      id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER,
+      time_updated INTEGER, data TEXT, sequence INTEGER
+    );
+    CREATE TABLE part (
+      id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+      time_created INTEGER, time_updated INTEGER, data TEXT, sequence INTEGER
+    );
+    CREATE TABLE model_usage (
+      id TEXT PRIMARY KEY, session_id TEXT, provider_id TEXT, model_id TEXT,
+      variant TEXT, computed_total_tokens INTEGER, provider_total_tokens INTEGER,
+      input_tokens INTEGER, output_tokens INTEGER, duration_ms INTEGER, started_at INTEGER
+    );
+    CREATE TABLE session_runtime_presence (session_id TEXT, owner_id TEXT, process_id INTEGER);
+  `);
+  zCliDb
+    .prepare(
+      `INSERT INTO session VALUES (
+        'sess_zcode_demo_001', '/tmp/sec-audit', '/tmp/sec-audit', '提取图片中的问题描述',
+        ?, ?, NULL, NULL, 'completed'
+      )`
+    )
+    .run(nowMs - 400000, nowMs - 100000);
+  zCliDb
+    .prepare(
+      `INSERT INTO message VALUES ('m-1', 'sess_zcode_demo_001', ?, ?, ?, 1)`
+    )
+    .run(nowMs - 390000, nowMs - 390000, JSON.stringify({ role: 'user' }));
+  zCliDb
+    .prepare(
+      `INSERT INTO part VALUES ('p-1', 'm-1', 'sess_zcode_demo_001', ?, ?, ?, 0)`
+    )
+    .run(
+      nowMs - 390000,
+      nowMs - 390000,
+      JSON.stringify({ type: 'text', text: '直接描述这个图的问题' })
+    );
+  zCliDb
+    .prepare(
+      `INSERT INTO message VALUES ('m-2', 'sess_zcode_demo_001', ?, ?, ?, 2)`
+    )
+    .run(nowMs - 380000, nowMs - 380000, JSON.stringify({ role: 'assistant' }));
+  zCliDb
+    .prepare(
+      `INSERT INTO part VALUES ('p-2', 'm-2', 'sess_zcode_demo_001', ?, ?, ?, 0)`
+    )
+    .run(
+      nowMs - 380000,
+      nowMs - 380000,
+      JSON.stringify({ type: 'text', text: '问题描述：test-pms.shands.cn 操作日志接口越权读取仍存在' })
+    );
+  zCliDb
+    .prepare(
+      `INSERT INTO model_usage VALUES (
+        'mu-1', 'sess_zcode_demo_001', 'qwen-alibaba-model-studio-cn', 'kimi-k3',
+        'max', 18500, 18500, 18000, 500, 6100, ?
+      )`
+    )
+    .run(nowMs - 380000);
+  zCliDb.close();
 }
 
 async function runTests() {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'alc-test-'));
   const codexHome = path.join(tmpRoot, 'codex-home');
+  const zcodeHome = path.join(tmpRoot, 'zcode-home');
   const dispatchDir = path.join(tmpRoot, 'dispatch-state');
   const pluginData = path.join(tmpRoot, 'plugin-data');
 
   try {
-    createSyntheticCodexHome(codexHome, dispatchDir);
+    createSyntheticCodexHome(codexHome, zcodeHome, dispatchDir);
 
     const child = spawn('bash', [LAUNCHER, '--data-dir', pluginData], {
       env: {
         ...process.env,
         CODEX_HOME: codexHome,
+        ZCODE_HOME: zcodeHome,
         AGY_DISPATCH_STATE_DIR: dispatchDir,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -289,20 +389,39 @@ async function runTests() {
     const openTool = toolsRes.result.tools.find((t) => t.name === 'open_codex_console');
     assert.equal(openTool?._meta?.ui?.resourceUri, 'ui://codex-console/app.html');
     assert.equal(openTool?._meta?.['com.google.antigravity/ui']?.entrypoints?.length, 2);
+    assert.equal(
+      openTool?._meta?.['com.google.antigravity/ui']?.entrypoints?.[0]?.title,
+      'Antigravity Lead Codex'
+    );
 
     // 3. Verify bundled single-file HTML resource
     const resRead = await rpc('resources/read', { uri: 'ui://codex-console/app.html' });
     assert.equal(resRead.result.contents[0].mimeType, 'text/html;profile=mcp-app');
     assert.ok(resRead.result.contents[0].text.length > 10000, 'bundled app.html is non-empty');
 
-    // 4. Verify console_snapshot merges Codex DBs + dispatch turn result & unwraps JSON reply
+    // 4. Verify console_snapshot merges Codex DBs + ZCode DBs + dispatch turn result & unwraps JSON reply
     const snapRes = await rpc('tools/call', { name: 'console_snapshot', arguments: { limit: 50 } });
     const snap = snapRes.result.structuredContent;
     assert.equal(snap.connected, true);
     assert.equal(snap.stats.runningCount, 1);
     assert.equal(snap.stats.goalBlockedCount, 1);
+    assert.equal(snap.stats.codexCount, 3);
+    assert.equal(snap.stats.zcodeCount, 1);
     assert.equal(snap.stats.agyCount, 2);
     assert.equal(snap.stats.managedCount, 2);
+    const zcodeTask = snap.tasks.find((t) => t.id === 'sess_zcode_demo_001');
+    assert.ok(zcodeTask, 'ZCode task loaded into unified console snapshot');
+    assert.equal(zcodeTask.engine, 'zcode');
+    assert.equal(zcodeTask.model, '百炼/kimi-k3');
+    assert.equal(zcodeTask.projectName, 'Security Audit Demo');
+
+    const zDetailRes = await rpc('tools/call', {
+      name: 'get_codex_task_detail',
+      arguments: { threadId: 'sess_zcode_demo_001' },
+    });
+    const zDetail = zDetailRes.result.structuredContent;
+    assert.equal(zDetail.messages.length, 2);
+    assert.ok(zDetail.messages[1].text.includes('操作日志接口越权读取仍存在'));
     const agyTask = snap.tasks.find((t) => t.id === '01a90000-0000-7000-8000-000000000001');
     const cleanedTask = snap.tasks.find((t) => t.id === '01a90000-0000-7000-8000-000000000003');
     assert.equal(cleanedTask.status.code, 'exec_done');

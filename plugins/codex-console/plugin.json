@@ -1,14 +1,14 @@
 {
   "name": "codex-console",
-  "displayName": "Codex Console",
-  "description": "Antigravity side-pane visual console (MCP App) for local Codex CLI, Desktop, and Worktree tasks: live progress streaming, read-only blocker diagnosis, codex queue wakeup, cross-session bindings, and send-back-to-chat.",
-  "version": "1.0.2",
+  "displayName": "Antigravity Lead Codex",
+  "description": "Antigravity 侧栏双引擎可视化控制台（Antigravity Lead Codex）：统一聚合本地 Codex CLI/Desktop 与 ZCode 国模任务、隔离 Worktree 受管子代理、实时进度流、只读卡点诊断、排队唤醒、跨会话绑定与发回主控对话。",
+  "version": "1.3.0",
   "logo": "assets/logo.svg",
   "homepage": "https://github.com/Koala973/antigravity-lead-codex",
   "repository": "https://github.com/Koala973/antigravity-lead-codex",
   "suggestedPrompts": [
-    "Open Codex Console in the side pane and inspect my active CLI/Worktree tasks",
-    "List all running or Goal-blocked Codex tasks and run a read-only blocker diagnosis",
-    "Record a cross-session Change-to-Codex-Thread binding in SQLite"
+    "Open Antigravity Lead Codex in the side pane and inspect my active Codex & ZCode tasks",
+    "List all running or Goal-blocked Codex and ZCode tasks and run a read-only blocker diagnosis",
+    "Record a cross-session Change-to-Thread binding in SQLite"
   ]
 }
