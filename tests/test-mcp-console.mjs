@@ -485,10 +485,47 @@ async function runTests() {
     assert.equal(listBindings.length, 1);
     await rpc('tools/call', { name: 'manage_collab_binding', arguments: { action: 'delete', id: bindingId } });
 
+    // 7. Verify engine settings tool (Codex required, ZCode optional toggle & custom route config)
+    const getEngineRes = await rpc('tools/call', {
+      name: 'console_engine_settings',
+      arguments: { action: 'get' },
+    });
+    const es1 = getEngineRes.result.structuredContent.engineSettings;
+    assert.equal(es1.config.codex.required, true);
+    assert.equal(es1.config.codex.enabled, true);
+
+    const disableZcodeRes = await rpc('tools/call', {
+      name: 'console_engine_settings',
+      arguments: {
+        action: 'save',
+        config: {
+          codex: { enabled: false }, // should be ignored since Codex is required
+          zcode: { enabled: false },
+          policy: { hideDisabledEngineTasks: true, reviewPolicy: 'codex_only' },
+        },
+      },
+    });
+    const es2 = disableZcodeRes.result.structuredContent.engineSettings;
+    assert.equal(es2.config.codex.enabled, true, 'Codex must remain enabled even if false is passed');
+    assert.equal(es2.config.zcode.enabled, false, 'ZCode can be toggled off as an optional engine');
+    assert.equal(es2.config.policy.reviewPolicy, 'codex_only');
+
+    const snapNoZcode = (await rpc('tools/call', { name: 'console_snapshot', arguments: {} })).result.structuredContent;
+    assert.equal(snapNoZcode.stats.zcodeCount, 0, 'ZCode tasks hidden when disabled and hideDisabledEngineTasks=true');
+
+    await rpc('tools/call', {
+      name: 'console_engine_settings',
+      arguments: { action: 'reset' },
+    });
+
     child.kill();
     console.log('[PASS] All MCP Codex Console integration tests passed.');
   } finally {
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 });
+    } catch {
+      // ignore late SQLite WAL cleanup race on exit
+    }
   }
 }
 

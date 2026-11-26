@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { loadEngineConfig, discoverZcodeEnvironment } from './engine-config.mjs';
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const ZCODE_HOME = process.env.ZCODE_HOME || path.join(os.homedir(), '.zcode');
@@ -19,7 +20,7 @@ function formatZcodeModelDisplay(rawModel) {
   const s = String(rawModel).trim();
   if (!s.includes('/')) return s;
   const [prov, mod] = s.split('/', 2);
-  const shortProv = ZCODE_PROVIDER_SHORT[prov];
+  const shortProv = ZCODE_PROVIDER_SHORT[prov] || discoverZcodeEnvironment().providerLabels?.[prov];
   return shortProv ? `${shortProv}/${mod}` : mod || s;
 }
 
@@ -796,14 +797,19 @@ export class CodexStore {
       };
     });
 
-    // 6b. Assemble ZCode task cards (both Antigravity-dispatched & ZCode Desktop tasks)
-    const zcodeTasks = this._loadZcodeTasks({
-      limit: Math.max(60, Math.floor(limit / 2)),
-      prefsMap,
-      dispatchBySession,
-      opsByThread,
-      bindingsByThread,
-    });
+    // 6b. Assemble ZCode task cards (respecting optional ZCode engine toggle)
+    const engineConfig = loadEngineConfig();
+    const skipZcodeTasks =
+      engineConfig.zcode?.enabled === false && engineConfig.policy?.hideDisabledEngineTasks === true;
+    const zcodeTasks = skipZcodeTasks
+      ? []
+      : this._loadZcodeTasks({
+          limit: Math.max(60, Math.floor(limit / 2)),
+          prefsMap,
+          dispatchBySession,
+          opsByThread,
+          bindingsByThread,
+        });
 
     const tasks = [...codexTasks, ...zcodeTasks].sort(
       (a, b) => (b.updatedAtMs || 0) - (a.updatedAtMs || 0)

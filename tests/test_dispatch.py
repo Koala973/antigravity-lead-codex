@@ -83,6 +83,39 @@ class DispatchAndHookTests(unittest.TestCase):
             "e2a41300-b652-45ec-9f78-ebd2ec7889be/deepseek-v4.1-flash",
         )
 
+    def test_engine_config_override_for_optional_zcode_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_file = pathlib.Path(tmp) / "engine_config.json"
+            cfg_file.write_text(
+                json.dumps(
+                    {
+                        "codex": {"required": True, "enabled": True},
+                        "zcode": {
+                            "enabled": True,
+                            "routes": {
+                                "code_and_audit": {
+                                    "primary": "custom-provider/deepseek-r1-custom",
+                                    "fallback1": "qwen-alibaba-model-studio-cn/kimi-k3",
+                                    "effort": "max",
+                                }
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old_path = self.dispatch.ENGINE_CONFIG_FILE
+            self.dispatch.ENGINE_CONFIG_FILE = cfg_file
+            try:
+                routed = self.dispatch.resolve_zcode_model_and_fallbacks(
+                    difficulty="hard",
+                    prompt="Implement API endpoint and unit tests",
+                )
+                self.assertEqual(routed["model"], "custom-provider/deepseek-r1-custom")
+                self.assertEqual(routed["fallback_chain"][0]["note"], "设置页主选模型")
+            finally:
+                self.dispatch.ENGINE_CONFIG_FILE = old_path
+
     def test_zcode_desktop_index_sync(self):
         with tempfile.TemporaryDirectory() as tmp:
             idx_db = pathlib.Path(tmp) / "tasks-index.sqlite"

@@ -39,13 +39,28 @@ const state = {
   bindings: [],
   quota: null,
   refreshingQuota: false,
+  engineSettings: null,
+  savingSettings: false,
 
-  activeTab: 'tasks',          // tasks | subagents | collab
+  activeTab: 'tasks',          // tasks | subagents | collab | settings
   narrowView: 'list',          // list | detail (used when container < 640px)
   engineFilter: 'all',         // all | codex | zcode
   detailSubTab: 'history',     // history | ops | git
   showDesktopTasks: false,
   showHiddenDrawer: false,
+
+  spawnDraft: {
+    backend: 'codex',
+    model: 'auto',
+    quality: 'max',
+    difficulty: 'auto',
+    isolation: 'worktree',
+    cwd: '',
+    prompt: '',
+    taskId: '',
+    changeKey: '',
+    showAdvanced: false,
+  },
 
   selectedThreadId: null,
   selectedAgentId: null,
@@ -256,6 +271,7 @@ async function refreshSnapshot({ silent = false } = {}) {
     state.managedAgents = data.managedAgents || [];
     state.bindings = data.bindings || [];
     if (data.quota) state.quota = data.quota;
+    if (data.engineSettings) state.engineSettings = data.engineSettings;
 
     if (!state.selectedThreadId && state.tasks.length) {
       const visible = state.tasks.filter((t) => !t.isSubagent && !t.hidden);
@@ -624,7 +640,7 @@ function renderTasksLeftRail() {
         <div class="filter-seg">
           <button class="tactile-btn" data-active="${state.engineFilter === 'all'}" data-engine-filter="all">全部</button>
           <button class="tactile-btn" data-active="${state.engineFilter === 'codex'}" data-engine-filter="codex">Codex</button>
-          <button class="tactile-btn" data-active="${state.engineFilter === 'zcode'}" data-engine-filter="zcode">ZCode</button>
+          ${state.engineSettings?.config?.zcode?.enabled !== false ? `<button class="tactile-btn" data-active="${state.engineFilter === 'zcode'}" data-engine-filter="zcode">ZCode</button>` : ''}
         </div>
       </div>
       <div class="task-list">${itemsHtml}</div>
@@ -1169,41 +1185,494 @@ function renderCollabDetailPane() {
   `;
 }
 
+function buildZcodeModelOptionsHtml(selectedVal, flatModels = [], currentValue = '') {
+  const seen = new Set();
+  const options = [];
+  const addOpt = (val, label) => {
+    if (!val || seen.has(val)) return;
+    seen.add(val);
+    options.push(`<option value="${esc(val)}" ${val === selectedVal ? 'selected' : ''}>${esc(label)}</option>`);
+  };
+  for (const m of flatModels) {
+    addOpt(m.fullId, `${m.providerName} / ${m.modelId}`);
+  }
+  if (currentValue && !seen.has(currentValue)) {
+    addOpt(currentValue, currentValue);
+  }
+  // Standard well-known defaults if user's local config hasn't been scanned yet
+  addOpt('qwen-alibaba-model-studio-cn/kimi-k3', '阿里云百炼 / kimi-k3');
+  addOpt('qwen-alibaba-model-studio-cn/deepseek-v4-pro-0813', '阿里云百炼 / deepseek-v4-pro-0813');
+  addOpt('qwen-alibaba-model-studio-cn/qwen3.8-max', '阿里云百炼 / qwen3.8-max');
+  addOpt('e2a41300-b652-45ec-9f78-ebd2ec7889be/glm-5.3', '腾讯TokenHub / glm-5.3 (1M窗口)');
+  addOpt('e2a41300-b652-45ec-9f78-ebd2ec7889be/deepseek-v4-pro-0813', '腾讯TokenHub / deepseek-v4-pro-0813');
+  addOpt('e2a41300-b652-45ec-9f78-ebd2ec7889be/kimi-k3', '腾讯TokenHub / kimi-k3');
+  addOpt('e2a41300-b652-45ec-9f78-ebd2ec7889be/deepseek-v4.1-flash', '腾讯TokenHub / deepseek-v4.1-flash');
+  return options.join('');
+}
+
+function renderSettingsWorkspace() {
+  const es = state.engineSettings || {};
+  const cfg = es.config || {
+    codex: { required: true, enabled: true, flagshipModel: 'auto', fastModel: 'auto', defaultQuality: 'smart', defaultEffort: 'xhigh', defaultIsolation: 'worktree' },
+    zcode: { required: false, enabled: true, scriptPath: '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs', syncDesktopIndex: true, defaultEffort: 'max', routes: {} },
+    customAgents: [],
+    policy: { costStrategy: 'effect_first', reviewPolicy: 'heterogeneous', hideDisabledEngineTasks: false },
+  };
+  const disc = es.discovery || { codex: { models: [] }, zcode: { providers: [], flatModels: [] }, customAgents: [] };
+  const codexModels = disc.codex?.models || [];
+  const zcodeFlat = disc.zcode?.flatModels || [];
+  const zcodeProviders = disc.zcode?.providers || [];
+  const zEnabled = cfg.zcode?.enabled !== false;
+  const routes = cfg.zcode?.routes || {};
+
+  const routeRows = [
+    { key: 'code_and_audit', title: '代码实现 · 单测补齐 · 静态审查', badge: '高频核心', desc: '成块功能模块编写、算法落地、批量单元测试及 Codex 代码的异构交叉初审' },
+    { key: 'reasoning_and_business', title: '中文复杂业务 · 安全分析 · 双盲出稿', badge: '深度推理', desc: '复杂产品逻辑推演、越权/安全漏洞分析、大架构方案双盲独立出稿' },
+    { key: 'wide_1m_context', title: '100 万超长上下文 · 跨 10+ 文件扫街', badge: '1M 窗口', desc: '全代码库摸底、大型遗留仓库跨模块调用链扫描与全局依赖梳理' },
+    { key: 'fast_tool_and_plugin', title: '飞书/办公插件 · 工具调用 · 快速任务', badge: '极速工具', desc: '飞书审批/文档办公插件联动、轻量脚本与高并发工具调用任务' },
+  ];
+
+  return `
+    <div class="settings-scroll">
+      <div class="settings-container">
+        <!-- Hero Architecture Summary & Global Action Bar -->
+        <section class="taper-card settings-card settings-hero">
+          <div class="settings-hero-top">
+            <div>
+              <div class="settings-title-row">
+                <span class="tactile-btn" style="height:24px;padding:0 10px">
+                  <span class="argon-spark">✦</span>
+                  <span class="argon-box">架构总览</span>
+                  <span class="argon-tier">ENGINE ROUTER</span>
+                </span>
+                <span class="settings-main-title">多引擎协同与智能路由配置中心</span>
+              </div>
+              <div class="settings-subtitle">
+                Codex 作为必选核心底座始终启用；ZCode 与其他 CLI Agent 作为可选备选引擎按需开启，未安装或停用时自动回退至 Codex 独立执行。
+              </div>
+            </div>
+            <div class="settings-hero-actions">
+              <button class="tactile-btn" id="btnSettingsProbe" title="重新扫描本机安装的 CLI 与模型配置">↻ 重新探测本机</button>
+              <button class="tactile-btn" id="btnSettingsReset" title="恢复为推荐的旗舰路由参数">恢复默认</button>
+              <button class="tactile-btn cta" id="btnSettingsSave">${state.savingSettings ? '保存中…' : '✦ 保存并同步配置'}</button>
+            </div>
+          </div>
+
+          <div class="arch-topology">
+            <div class="arch-node">
+              <span class="argon-box">主控</span>
+              <strong>反重力哈基咪</strong>
+              <span class="argon-tier">前端 · 终审 · 拍板</span>
+            </div>
+            <span class="arch-arrow">⇄</span>
+            <div class="arch-node active">
+              <span class="argon-box">必选底座</span>
+              <strong>OpenAI Codex</strong>
+              <span class="status-pill ok">始终启用</span>
+            </div>
+            <span class="arch-arrow">⇄</span>
+            <div class="arch-node ${zEnabled ? 'active' : 'muted'}">
+              <span class="argon-box">可选备选</span>
+              <strong>ZCode 国模旗舰池</strong>
+              <span class="status-pill ${zEnabled ? 'ok' : 'off'}">${zEnabled ? `已启用 (${zcodeFlat.length} 模型)` : '已停用'}</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Card 1: Required Core Engine - OpenAI Codex -->
+        <section class="taper-card settings-card">
+          <div class="settings-card-head">
+            <div class="settings-title-row">
+              <span class="tactile-btn" style="height:24px;padding:0 9px">
+                <span class="argon-spark">✦</span>
+                <span class="argon-box">Codex</span>
+                <span style="font-weight:650;color:var(--fg-primary)">OpenAI 核心底座</span>
+                <span class="argon-tier">必选</span>
+              </span>
+              <span class="settings-hint">高难后端核心架构、复杂并发与状态机排障、操作系统级目录写锁硬沙箱</span>
+            </div>
+            <span class="status-pill locked">🔒 必选引擎 · 不可关闭</span>
+          </div>
+
+          <div class="settings-grid-2">
+            <div class="field">
+              <label>高难架构 / 状态机默认旗舰模型</label>
+              <select id="cfgCodexFlagship">
+                <option value="auto" ${cfg.codex?.flagshipModel === 'auto' ? 'selected' : ''}>auto（自动选用本机最新一代旗舰模型）</option>
+                ${codexModels.map((m) => `<option value="${esc(m.slug)}" ${cfg.codex?.flagshipModel === m.slug ? 'selected' : ''}>${esc(m.slug)}${m.contextWindow ? ` (${Math.round(m.contextWindow / 1000)}k)` : ''}</option>`).join('')}
+              </select>
+            </div>
+            <div class="field">
+              <label>常规模块 / 快速巡检默认模型</label>
+              <select id="cfgCodexFast">
+                <option value="auto" ${cfg.codex?.fastModel === 'auto' ? 'selected' : ''}>auto（自动选用宽窗口/高速兄弟模型）</option>
+                ${codexModels.map((m) => `<option value="${esc(m.slug)}" ${cfg.codex?.fastModel === m.slug ? 'selected' : ''}>${esc(m.slug)}${m.contextWindow ? ` (${Math.round(m.contextWindow / 1000)}k)` : ''}</option>`).join('')}
+              </select>
+            </div>
+          </div>
+
+          <div class="settings-grid-3">
+            <div class="field">
+              <label>默认推理强度</label>
+              <select id="cfgCodexEffort">
+                <option value="xhigh" ${cfg.codex?.defaultEffort === 'xhigh' ? 'selected' : ''}>xhigh（极高推理 · 推荐）</option>
+                <option value="max" ${cfg.codex?.defaultEffort === 'max' ? 'selected' : ''}>max（最高满血推理）</option>
+                <option value="high" ${cfg.codex?.defaultEffort === 'high' ? 'selected' : ''}>high（标准高推理）</option>
+                <option value="medium" ${cfg.codex?.defaultEffort === 'medium' ? 'selected' : ''}>medium（均衡推理）</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>默认沙箱隔离模式</label>
+              <select id="cfgCodexIsolation">
+                <option value="worktree" ${cfg.codex?.defaultIsolation !== 'inplace' ? 'selected' : ''}>独立 Git Worktree（推荐隔离）</option>
+                <option value="inplace" ${cfg.codex?.defaultIsolation === 'inplace' ? 'selected' : ''}>原地工作区（In-place）</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Codex CLI 路径（留空自动探测）</label>
+              <input id="cfgCodexBin" value="${esc(cfg.codex?.binPath || '')}" placeholder="${esc(disc.codex?.binPath || '自动探测 codex')}" />
+            </div>
+          </div>
+        </section>
+
+        <!-- Card 2: Optional Auxiliary Engine - ZCode National Flagship Pool -->
+        <section class="taper-card settings-card ${zEnabled ? '' : 'card-disabled'}">
+          <div class="settings-card-head">
+            <div class="settings-title-row">
+              <span class="tactile-btn" style="height:24px;padding:0 9px">
+                <span class="argon-spark">✦</span>
+                <span class="argon-box">ZCode</span>
+                <span style="font-weight:650;color:var(--fg-primary)">国模旗舰池</span>
+                <span class="argon-tier">可选备选</span>
+              </span>
+              <span class="settings-hint">自动读取本机 ~/.zcode/v2/provider_config.json 渠道与模型，支持四场景点将与三级跨渠道灾备</span>
+            </div>
+            <button
+              type="button"
+              class="tactile-btn switch-pill"
+              id="btnToggleZcodeEnabled"
+              data-active="${zEnabled}"
+            >
+              <span class="status-dot ${zEnabled ? 'running' : ''}"></span>
+              <span>${zEnabled ? '已启用 ZCode 备选引擎' : '已停用（点击启用）'}</span>
+            </button>
+          </div>
+
+          <div class="zcode-discovery-bar">
+            <div>
+              <strong>本机探测状态：</strong>
+              <span>CLI 脚本 ${disc.zcode?.scriptExists ? '✓ 已就绪' : '⚠ 未检测到默认路径'}</span>
+              <span>·</span>
+              <span>已发现 <strong>${zcodeProviders.length}</strong> 个渠道（${zcodeProviders.map((p) => `${esc(p.providerName)}: ${p.models.length} 模型`).join(' / ') || '无本机渠道配置，可手动填入或安装 ZCode'}）</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+              <label class="dup-toggle">
+                <input type="checkbox" id="cfgZcodeSyncDesktop" ${cfg.zcode?.syncDesktopIndex !== false ? 'checked' : ''} />
+                同步至 ZCode 桌面端任务列表
+              </label>
+              <label class="dup-toggle">
+                <input type="checkbox" id="cfgHideDisabledTasks" ${cfg.policy?.hideDisabledEngineTasks ? 'checked' : ''} />
+                停用时隐藏 ZCode 历史会话
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-grid-2" style="margin-bottom:10px">
+            <div class="field">
+              <label>ZCode CLI 执行脚本路径</label>
+              <input id="cfgZcodeScript" value="${esc(cfg.zcode?.scriptPath || '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs')}" />
+            </div>
+            <div class="field">
+              <label>ZCode 全局默认推理挡位</label>
+              <select id="cfgZcodeEffort">
+                <option value="max" ${cfg.zcode?.defaultEffort !== 'xhigh' && cfg.zcode?.defaultEffort !== 'high' ? 'selected' : ''}>max（满血深度思考 · 推荐）</option>
+                <option value="xhigh" ${cfg.zcode?.defaultEffort === 'xhigh' ? 'selected' : ''}>xhigh（极高推理 · Qwen3.8 适用）</option>
+                <option value="high" ${cfg.zcode?.defaultEffort === 'high' ? 'selected' : ''}>high（标准高推理）</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="routes-matrix-title">四大任务场景主选模型与跨渠道三级灾备矩阵</div>
+          <div class="routes-matrix">
+            ${routeRows
+              .map((row) => {
+                const r = routes[row.key] || {};
+                return `
+                  <div class="route-box">
+                    <div class="route-box-head">
+                      <div>
+                        <span class="argon-box">${esc(row.badge)}</span>
+                        <strong style="margin-left:6px">${esc(row.title)}</strong>
+                      </div>
+                      <span class="route-box-desc">${esc(row.desc)}</span>
+                    </div>
+                    <div class="settings-grid-4">
+                      <div class="field">
+                        <label>主选模型 (Primary)</label>
+                        <select data-route-key="${row.key}" data-route-slot="primary">
+                          ${buildZcodeModelOptionsHtml(r.primary, zcodeFlat, r.primary)}
+                        </select>
+                      </div>
+                      <div class="field">
+                        <label>一级热备 (Fallback 1)</label>
+                        <select data-route-key="${row.key}" data-route-slot="fallback1">
+                          ${buildZcodeModelOptionsHtml(r.fallback1, zcodeFlat, r.fallback1)}
+                        </select>
+                      </div>
+                      <div class="field">
+                        <label>二级跨渠道热备 (Fallback 2)</label>
+                        <select data-route-key="${row.key}" data-route-slot="fallback2">
+                          ${buildZcodeModelOptionsHtml(r.fallback2, zcodeFlat, r.fallback2)}
+                        </select>
+                      </div>
+                      <div class="field">
+                        <label>推理挡位</label>
+                        <select data-route-key="${row.key}" data-route-slot="effort">
+                          <option value="max" ${r.effort !== 'xhigh' && r.effort !== 'high' ? 'selected' : ''}>max (满血)</option>
+                          <option value="xhigh" ${r.effort === 'xhigh' ? 'selected' : ''}>xhigh (极高)</option>
+                          <option value="high" ${r.effort === 'high' ? 'selected' : ''}>high (高)</option>
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                `;
+              })
+              .join('')}
+          </div>
+        </section>
+
+        <!-- Card 3: Other Extensible Backup CLI Agents + Cross-Review Policy -->
+        <div class="settings-grid-2">
+          <section class="taper-card settings-card">
+            <div class="settings-card-head">
+              <div class="settings-title-row">
+                <span class="tactile-btn" style="height:24px;padding:0 9px">
+                  <span class="argon-spark">✦</span>
+                  <span class="argon-box">扩展备选</span>
+                  <span style="font-weight:650;color:var(--fg-primary)">其他可接入 CLI Agent</span>
+                </span>
+              </div>
+            </div>
+            <div class="custom-agents-list">
+              ${(cfg.customAgents || [])
+                .map((ag, idx) => {
+                  const statusObj = (disc.customAgents || []).find((x) => x.id === ag.id) || {};
+                  return `
+                    <div class="route-box" style="margin-bottom:8px">
+                      <div class="route-box-head" style="margin-bottom:6px">
+                        <div style="display:flex;align-items:center;gap:6px">
+                          <span class="argon-box">${esc(ag.id)}</span>
+                          <strong>${esc(ag.name)}</strong>
+                          <span class="status-pill ${statusObj.available ? 'ok' : 'off'}">${statusObj.available ? '本机已安装' : '未探测到 CLI'}</span>
+                        </div>
+                        <label class="dup-toggle">
+                          <input type="checkbox" data-custom-agent-idx="${idx}" data-custom-field="enabled" ${ag.enabled ? 'checked' : ''} />
+                          作为备选启用
+                        </label>
+                      </div>
+                      <div class="settings-grid-2">
+                        <div class="field">
+                          <label>命令路径</label>
+                          <input data-custom-agent-idx="${idx}" data-custom-field="binPath" value="${esc(ag.binPath || '')}" placeholder="claude / gemini" />
+                        </div>
+                        <div class="field">
+                          <label>默认模型</label>
+                          <input data-custom-agent-idx="${idx}" data-custom-field="defaultModel" value="${esc(ag.defaultModel || '')}" />
+                        </div>
+                      </div>
+                    </div>
+                  `;
+                })
+                .join('')}
+            </div>
+          </section>
+
+          <section class="taper-card settings-card">
+            <div class="settings-card-head">
+              <div class="settings-title-row">
+                <span class="tactile-btn" style="height:24px;padding:0 9px">
+                  <span class="argon-spark">✦</span>
+                  <span class="argon-box">审查与成本</span>
+                  <span style="font-weight:650;color:var(--fg-primary)">异构交叉审查策略</span>
+                </span>
+              </div>
+            </div>
+            <div class="field">
+              <label>合并前代码静态初审策略 (dispatch.py review --backend auto)</label>
+              <select id="cfgPolicyReview">
+                <option value="heterogeneous" ${cfg.policy?.reviewPolicy !== 'dual_engine' && cfg.policy?.reviewPolicy !== 'codex_only' ? 'selected' : ''}>异构交叉互审（Codex 写交 ZCode 审，ZCode 写交 Codex 审；未启用备选时自动回退 Codex）</option>
+                <option value="dual_engine" ${cfg.policy?.reviewPolicy === 'dual_engine' ? 'selected' : ''}>双引擎最高推理叠加深审（涉及资金、权限、登录、外发消息）</option>
+                <option value="codex_only" ${cfg.policy?.reviewPolicy === 'codex_only' ? 'selected' : ''}>仅使用 Codex 旗舰模型审查</option>
+              </select>
+            </div>
+            <div class="field" style="margin-top:10px">
+              <label>模型效果与 Token 成本偏好</label>
+              <select id="cfgPolicyCost">
+                <option value="effect_first" ${cfg.policy?.costStrategy !== 'balanced' ? 'selected' : ''}>不计成本 · 只看最高效果（强制锁定 max / xhigh 最高推理挡位）</option>
+                <option value="balanced" ${cfg.policy?.costStrategy === 'balanced' ? 'selected' : ''}>按任务难度自适应均衡（轻量 medium / 常规 high / 高难 xhigh）</option>
+              </select>
+            </div>
+            <div class="settings-footnote">
+              配置文件持久化路径：<code>${esc(es.configPath || '~/.local/state/multi-agent-dispatch/engine_config.json')}</code>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderModal() {
   if (!state.modal) return '';
   const task = selectedTask();
 
   if (state.modal === 'spawn') {
-    const cwd = task?.dispatchTask?.repoRoot || task?.cwd || '';
+    const es = state.engineSettings || {};
+    const cfg = es.config || {};
+    const disc = es.discovery || {};
+    const zEnabled = cfg.zcode?.enabled !== false;
+    const d = state.spawnDraft;
+    const effectiveBackend = !zEnabled && d.backend === 'zcode' ? 'codex' : d.backend;
+    const cwd = d.cwd || task?.dispatchTask?.repoRoot || task?.cwd || '';
+
+    const codexModels = disc.codex?.models || [];
+    const zcodeFlat = disc.zcode?.flatModels || [];
+
+    let modelOptionsHtml = '';
+    if (effectiveBackend === 'codex') {
+      modelOptionsHtml = `
+        <option value="auto" ${d.model === 'auto' ? 'selected' : ''}>✦ 智能自动路由（按任务难度自动匹配最新旗舰 / 高速模型）</option>
+        ${codexModels.map((m) => `<option value="${esc(m.slug)}" ${d.model === m.slug ? 'selected' : ''}>${esc(m.slug)}${m.description ? ` · ${esc(m.description.slice(0, 42))}` : ''}</option>`).join('')}
+      `;
+    } else {
+      modelOptionsHtml = `
+        <option value="auto" ${d.model === 'auto' ? 'selected' : ''}>✦ 四大场景自动点将（含百炼 + TokenHub 三级跨渠道热备）</option>
+        ${zcodeFlat.map((m) => `<option value="${esc(m.fullId)}" ${d.model === m.fullId ? 'selected' : ''}>${esc(m.providerName)} / ${esc(m.modelId)}</option>`).join('')}
+        ${!zcodeFlat.length ? `
+          <option value="qwen-alibaba-model-studio-cn/kimi-k3">阿里云百炼 / kimi-k3 (综合/业务/审计主选)</option>
+          <option value="qwen-alibaba-model-studio-cn/deepseek-v4-pro-0813">阿里云百炼 / deepseek-v4-pro-0813 (深度代码/单测主选)</option>
+          <option value="e2a41300-b652-45ec-9f78-ebd2ec7889be/glm-5.3">腾讯TokenHub / glm-5.3 (100万上下文全库扫街)</option>
+          <option value="qwen-alibaba-model-studio-cn/qwen3.8-max">阿里云百炼 / qwen3.8-max (飞书/办公插件工具)</option>
+        ` : ''}
+      `;
+    }
+
     return `
       <div class="modal-backdrop" data-close-modal="1">
-        <div class="modal">
-          <div class="modal-head"><span>新建受管子代理</span><button class="tactile-btn icon-only" data-close-modal="1">✕</button></div>
-          <div class="field"><label>工作目录</label><input id="mSpawnCwd" value="${esc(cwd)}" placeholder="/path/to/repo" /></div>
-          <div class="field-grid-2">
-            <div class="field">
-              <label>执行引擎</label>
-              <select id="mSpawnBackend">
-                <option value="codex" selected>Codex (GPT-6.2)</option>
-                <option value="zcode">ZCode (国模旗舰池)</option>
-              </select>
+        <div class="taper-card modal modal-spawn">
+          <div class="modal-head">
+            <div class="modal-title-group">
+              <span class="tactile-btn" style="height:24px;padding:0 9px">
+                <span class="argon-spark">✦</span>
+                <span class="argon-box">派单中心</span>
+                <span class="argon-tier">WORKTREE</span>
+              </span>
+              <span class="modal-title-text">新建受管子代理</span>
             </div>
-            <div class="field">
-              <label>模型 (可选)</label>
-              <input id="mSpawnModel" placeholder="auto / kimi-k3 / glm-5.3" />
+            <button class="tactile-btn icon-only" data-close-modal="1" title="关闭">✕</button>
+          </div>
+
+          <div class="field">
+            <label>目标仓库 / 工作区路径</label>
+            <input id="mSpawnCwd" value="${esc(cwd)}" placeholder="/Users/.../repo" />
+          </div>
+
+          <div class="field">
+            <div class="field-label-row">
+              <label>选择执行引擎（Codex 必选底座 · ZCode 可选备选）</label>
+              <button type="button" class="link-micro-btn" id="btnJumpSettingsFromSpawn">⚙ 引擎与路由设置</button>
+            </div>
+            <div class="engine-cards-row">
+              <button
+                type="button"
+                class="engine-pick-card ${effectiveBackend === 'codex' ? 'selected' : ''}"
+                data-pick-backend="codex"
+              >
+                <div class="engine-pick-top">
+                  <span class="argon-spark">✦</span>
+                  <span class="argon-box">Codex</span>
+                  <strong>OpenAI 核心引擎</strong>
+                  <span class="argon-tier">必选</span>
+                </div>
+                <div class="engine-pick-desc">高难后端架构 · 状态机并发排障 · OS 级硬沙箱</div>
+              </button>
+
+              <button
+                type="button"
+                class="engine-pick-card ${effectiveBackend === 'zcode' ? 'selected' : ''} ${zEnabled ? '' : 'disabled-card'}"
+                data-pick-backend="${zEnabled ? 'zcode' : 'go_settings'}"
+              >
+                <div class="engine-pick-top">
+                  <span class="argon-spark">✦</span>
+                  <span class="argon-box">ZCode</span>
+                  <strong>国模旗舰池</strong>
+                  <span class="argon-tier">${zEnabled ? '备选已启用' : '未启用 · 去开启'}</span>
+                </div>
+                <div class="engine-pick-desc">
+                  ${zEnabled ? '百炼 + TokenHub · Kimi-K3 / DeepSeek-V4 / 1M GLM-5.3' : '当前已作为可选项停用，点击前往设置页一键开启'}
+                </div>
+              </button>
             </div>
           </div>
-          <div class="field-grid-3">
-            <div class="field"><label>质量</label><select id="mSpawnQuality"><option value="smart" selected>smart</option><option value="max">max</option><option value="balanced">balanced</option></select></div>
-            <div class="field"><label>难度</label><select id="mSpawnDiff"><option value="auto" selected>auto</option><option value="low">low</option><option value="medium">medium</option><option value="hard">hard</option><option value="extreme">extreme</option></select></div>
-            <div class="field"><label>隔离</label><select id="mSpawnIso"><option value="worktree" selected>worktree</option><option value="inplace">inplace</option></select></div>
+
+          <div class="field">
+            <label>模型与场景路由策略</label>
+            <select id="mSpawnModel">${modelOptionsHtml}</select>
           </div>
-          <div class="field-grid-2">
-            <div class="field"><label>Task ID</label><input id="mSpawnTaskId" placeholder="可选" /></div>
-            <div class="field"><label>Change</label><input id="mSpawnChange" placeholder="可选" /></div>
+
+          <div class="spawn-pills-grid">
+            <div class="field">
+              <label>推理与质量策略</label>
+              <div class="pill-seg-group">
+                <button type="button" class="tactile-btn" data-spawn-quality="max" data-active="${d.quality === 'max'}">满血效果 (Max)</button>
+                <button type="button" class="tactile-btn" data-spawn-quality="smart" data-active="${d.quality === 'smart'}">智能路由 (Smart)</button>
+                <button type="button" class="tactile-btn" data-spawn-quality="balanced" data-active="${d.quality === 'balanced'}">均衡 (Balanced)</button>
+              </div>
+            </div>
+
+            <div class="field">
+              <label>工作区沙箱隔离</label>
+              <div class="pill-seg-group">
+                <button type="button" class="tactile-btn" data-spawn-iso="worktree" data-active="${d.isolation === 'worktree'}">独立 Git Worktree</button>
+                <button type="button" class="tactile-btn" data-spawn-iso="inplace" data-active="${d.isolation === 'inplace'}">当前目录 (In-place)</button>
+              </div>
+            </div>
           </div>
-          <div class="field"><label>任务指令</label><textarea id="mSpawnPrompt" rows="4"></textarea></div>
-          <div class="modal-foot"><button class="tactile-btn" data-close-modal="1">取消</button><button class="tactile-btn cta" id="btnSubmitSpawn">启动</button></div>
+
+          <div class="field">
+            <label>任务难度定级</label>
+            <div class="pill-seg-group">
+              <button type="button" class="tactile-btn" data-spawn-diff="auto" data-active="${d.difficulty === 'auto'}">✦ 自动识别</button>
+              <button type="button" class="tactile-btn" data-spawn-diff="low" data-active="${d.difficulty === 'low'}">轻量 (Low)</button>
+              <button type="button" class="tactile-btn" data-spawn-diff="medium" data-active="${d.difficulty === 'medium'}">常规 (Medium)</button>
+              <button type="button" class="tactile-btn" data-spawn-diff="hard" data-active="${d.difficulty === 'hard'}">高难 (Hard)</button>
+              <button type="button" class="tactile-btn" data-spawn-diff="extreme" data-active="${d.difficulty === 'extreme'}">极限 (Extreme)</button>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>任务指令（清晰说明接口定义、验收标准与需一并修改的同类项）</label>
+            <textarea id="mSpawnPrompt" rows="4" placeholder="例如：在隔离工作树中实现某模块并补齐单元测试，完成后运行 pytest 核实…">${esc(d.prompt)}</textarea>
+          </div>
+
+          <div class="spawn-adv-wrap">
+            <button type="button" class="link-micro-btn" id="btnToggleSpawnAdv">
+              ${d.showAdvanced ? '▾ 收起高级绑定选项 (Task ID / Change 标识)' : '▸ 展开高级绑定选项 (自定义 Task ID / 跨会话 Change 标识)'}
+            </button>
+            ${d.showAdvanced ? `
+              <div class="field-grid-2" style="margin-top:8px">
+                <div class="field"><label>自定义 Task ID</label><input id="mSpawnTaskId" value="${esc(d.taskId)}" placeholder="留空自动生成" /></div>
+                <div class="field"><label>跨会话 Change 标识</label><input id="mSpawnChange" value="${esc(d.changeKey)}" placeholder="如 feat-auth-flow" /></div>
+              </div>
+            ` : ''}
+          </div>
+
+          <div class="modal-foot">
+            <button class="tactile-btn" data-close-modal="1">取消</button>
+            <button class="tactile-btn cta" id="btnSubmitSpawn">
+              <span>✦ 启动 ${effectiveBackend === 'zcode' ? 'ZCode' : 'Codex'} 子代理</span>
+            </button>
+          </div>
         </div>
       </div>`;
   }
@@ -1211,10 +1680,26 @@ function renderModal() {
   if (state.modal === 'readonly') {
     return `
       <div class="modal-backdrop" data-close-modal="1">
-        <div class="modal">
-          <div class="modal-head"><span>只读提问</span><button class="tactile-btn icon-only" data-close-modal="1">✕</button></div>
-          <div class="field"><textarea id="mReadonlyPrompt" rows="4"></textarea></div>
-          <div class="modal-foot"><button class="tactile-btn" data-close-modal="1">取消</button><button class="tactile-btn cta" id="btnSubmitReadonly">提问</button></div>
+        <div class="taper-card modal">
+          <div class="modal-head">
+            <div class="modal-title-group">
+              <span class="tactile-btn" style="height:24px;padding:0 9px">
+                <span class="argon-spark">✦</span>
+                <span class="argon-box">${esc(task?.engineLabel || 'Codex')}</span>
+                <span class="argon-tier">READ-ONLY</span>
+              </span>
+              <span class="modal-title-text">非侵入式只读提问</span>
+            </div>
+            <button class="tactile-btn icon-only" data-close-modal="1">✕</button>
+          </div>
+          <div class="field">
+            <label>提问内容（在只读沙箱中检视当前会话上下文，不修改任何工作区文件）</label>
+            <textarea id="mReadonlyPrompt" rows="4" placeholder="请输入要向当前会话询问的问题…"></textarea>
+          </div>
+          <div class="modal-foot">
+            <button class="tactile-btn" data-close-modal="1">取消</button>
+            <button class="tactile-btn cta" id="btnSubmitReadonly">✦ 发起只读提问</button>
+          </div>
         </div>
       </div>`;
   }
@@ -1222,17 +1707,46 @@ function renderModal() {
   if (state.modal === 'binding') {
     return `
       <div class="modal-backdrop" data-close-modal="1">
-        <div class="modal">
-          <div class="modal-head"><span>新建绑定</span><button class="tactile-btn icon-only" data-close-modal="1">✕</button></div>
-          <div class="field"><label>标识</label><input id="mBindKey" /></div>
-          <div class="field"><label>目标</label><input id="mBindGoal" /></div>
-          <div class="field-grid-2">
-            <div class="field"><label>负责方</label><select id="mBindOwner"><option value="codex">codex</option><option value="zcode">zcode</option><option value="antigravity">antigravity</option><option value="shared">shared</option></select></div>
-            <div class="field"><label>状态</label><select id="mBindStatus"><option value="active">active</option><option value="blocked">blocked</option><option value="reviewing">reviewing</option><option value="completed">completed</option></select></div>
+        <div class="taper-card modal">
+          <div class="modal-head">
+            <div class="modal-title-group">
+              <span class="tactile-btn" style="height:24px;padding:0 9px">
+                <span class="argon-spark">✦</span>
+                <span class="argon-box">协作绑定</span>
+                <span class="argon-tier">CHANGE</span>
+              </span>
+              <span class="modal-title-text">新建跨会话绑定</span>
+            </div>
+            <button class="tactile-btn icon-only" data-close-modal="1">✕</button>
           </div>
-          <div class="field"><label>会话 ID</label><input id="mBindThread" value="${esc(task?.id || '')}" /></div>
-          <div class="field"><label>备注</label><textarea id="mBindNotes" rows="2"></textarea></div>
-          <div class="modal-foot"><button class="tactile-btn" data-close-modal="1">取消</button><button class="tactile-btn cta" id="btnSubmitBinding">保存</button></div>
+          <div class="field"><label>Change / 功能标识</label><input id="mBindKey" placeholder="例如 feat-multi-engine-router" /></div>
+          <div class="field"><label>目标简述</label><input id="mBindGoal" placeholder="清晰描述该任务的目标与交付边界" /></div>
+          <div class="field-grid-2">
+            <div class="field">
+              <label>当前责任方</label>
+              <select id="mBindOwner">
+                <option value="codex">Codex (核心后端)</option>
+                <option value="zcode">ZCode (国模旗舰池)</option>
+                <option value="antigravity">Antigravity (主控哈基咪)</option>
+                <option value="shared">Shared (多引擎协同)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>当前状态</label>
+              <select id="mBindStatus">
+                <option value="active">进行中 (active)</option>
+                <option value="reviewing">审查中 (reviewing)</option>
+                <option value="blocked">阻塞待决策 (blocked)</option>
+                <option value="completed">已完成 (completed)</option>
+              </select>
+            </div>
+          </div>
+          <div class="field"><label>关联会话 ID</label><input id="mBindThread" value="${esc(task?.id || '')}" /></div>
+          <div class="field"><label>交接备注</label><textarea id="mBindNotes" rows="2" placeholder="可选：记录接口约定或审查意见"></textarea></div>
+          <div class="modal-foot">
+            <button class="tactile-btn" data-close-modal="1">取消</button>
+            <button class="tactile-btn cta" id="btnSubmitBinding">✦ 保存绑定</button>
+          </div>
         </div>
       </div>`;
   }
@@ -1240,10 +1754,22 @@ function renderModal() {
   if (state.modal === 'rename') {
     return `
       <div class="modal-backdrop" data-close-modal="1">
-        <div class="modal">
-          <div class="modal-head"><span>重命名</span><button class="tactile-btn icon-only" data-close-modal="1">✕</button></div>
-          <div class="field"><input id="mRenameInput" value="${esc(task?.customTitle || task?.title || '')}" /></div>
-          <div class="modal-foot"><button class="tactile-btn" data-close-modal="1">取消</button><button class="tactile-btn cta" id="btnSubmitRename">保存</button></div>
+        <div class="taper-card modal">
+          <div class="modal-head">
+            <div class="modal-title-group">
+              <span class="tactile-btn" style="height:24px;padding:0 9px">
+                <span class="argon-spark">✦</span>
+                <span class="argon-box">会话别名</span>
+              </span>
+              <span class="modal-title-text">重命名任务</span>
+            </div>
+            <button class="tactile-btn icon-only" data-close-modal="1">✕</button>
+          </div>
+          <div class="field"><label>自定义显示名称（留空则恢复原始标题）</label><input id="mRenameInput" value="${esc(task?.customTitle || task?.title || '')}" /></div>
+          <div class="modal-foot">
+            <button class="tactile-btn" data-close-modal="1">取消</button>
+            <button class="tactile-btn cta" id="btnSubmitRename">✦ 保存名称</button>
+          </div>
         </div>
       </div>`;
   }
@@ -1264,6 +1790,7 @@ function render() {
   const scrollTask = root.querySelector('.task-list')?.scrollTop ?? 0;
   const scrollDetail = root.querySelector('.detail-scroll')?.scrollTop ?? 0;
   const scrollHidden = root.querySelector('.hidden-drawer-body')?.scrollTop ?? 0;
+  const scrollSettings = root.querySelector('.settings-scroll')?.scrollTop ?? 0;
 
   const s = state.stats;
   const cat = getCatState();
@@ -1274,8 +1801,10 @@ function render() {
     workspaceHtml = `${renderTasksLeftRail()}${renderTaskDetailPane()}`;
   } else if (state.activeTab === 'subagents') {
     workspaceHtml = `${renderSubagentsLeftRail()}${renderSubagentDetailPane()}`;
-  } else {
+  } else if (state.activeTab === 'collab') {
     workspaceHtml = `${renderCollabLeftRail()}${renderCollabDetailPane()}`;
+  } else if (state.activeTab === 'settings') {
+    workspaceHtml = renderSettingsWorkspace();
   }
 
   const drillClass = state.narrowView === 'detail' ? 'drill-detail' : 'drill-list';
@@ -1295,6 +1824,9 @@ function render() {
             <button class="tactile-btn" data-active="${state.activeTab === 'collab'}" data-tab="collab">
               协作${s.collabCount ? `<span class="nav-num">${s.collabCount}</span>` : ''}
             </button>
+            <button class="tactile-btn" data-active="${state.activeTab === 'settings'}" data-tab="settings">
+              设置
+            </button>
           </nav>
         </div>
         <div class="topbar-right">
@@ -1306,8 +1838,9 @@ function render() {
             freezeFlip: state.catFreezeFlip,
           })}
           ${renderQuotaWidget()}
+          <button class="tactile-btn icon-only" id="btnOpenSettings" data-active="${state.activeTab === 'settings'}" title="引擎与路由设置">⚙</button>
           <button class="tactile-btn icon-only" id="btnRefresh" title="刷新">${state.loadingSnapshot ? '·' : '↻'}</button>
-          <button class="tactile-btn icon-only cta" id="btnOpenSpawn" title="新建子代理">+</button>
+          <button class="tactile-btn icon-only cta" id="btnOpenSpawn" title="新建受管子代理">+</button>
         </div>
       </header>
 
@@ -1326,6 +1859,8 @@ function render() {
   if (nd) nd.scrollTop = scrollDetail;
   const nh = root.querySelector('.hidden-drawer-body');
   if (nh) nh.scrollTop = scrollHidden;
+  const ns = root.querySelector('.settings-scroll');
+  if (ns) ns.scrollTop = scrollSettings;
 
   if (activeId) {
     const el = document.getElementById(activeId);
@@ -1393,6 +1928,13 @@ function bindEvents() {
   });
 
   const openSpawn = () => {
+    const t = selectedTask();
+    state.spawnDraft.cwd = state.spawnDraft.cwd || t?.dispatchTask?.repoRoot || t?.cwd || '';
+    const zEnabled = state.engineSettings?.config?.zcode?.enabled !== false;
+    if (!zEnabled && state.spawnDraft.backend === 'zcode') {
+      state.spawnDraft.backend = 'codex';
+      state.spawnDraft.model = 'auto';
+    }
     state.modal = 'spawn';
     render();
   };
@@ -1400,6 +1942,10 @@ function bindEvents() {
   document.getElementById('btnComposerSpawn')?.addEventListener('click', openSpawn);
   document.getElementById('btnSpawnFromTab')?.addEventListener('click', openSpawn);
   document.getElementById('btnSpawnEmpty')?.addEventListener('click', openSpawn);
+  document.getElementById('btnOpenSettings')?.addEventListener('click', () => {
+    state.activeTab = 'settings';
+    render();
+  });
 
   const openBinding = () => {
     state.modal = 'binding';
@@ -1552,27 +2098,227 @@ function bindEvents() {
     })
   );
 
+  // Spawn Modal Interactive Pill & Engine Card Controls
+  const syncSpawnTextFields = () => {
+    const cwdEl = document.getElementById('mSpawnCwd');
+    const promptEl = document.getElementById('mSpawnPrompt');
+    const modEl = document.getElementById('mSpawnModel');
+    const tidEl = document.getElementById('mSpawnTaskId');
+    const chgEl = document.getElementById('mSpawnChange');
+    if (cwdEl) state.spawnDraft.cwd = cwdEl.value;
+    if (promptEl) state.spawnDraft.prompt = promptEl.value;
+    if (modEl) state.spawnDraft.model = modEl.value;
+    if (tidEl) state.spawnDraft.taskId = tidEl.value;
+    if (chgEl) state.spawnDraft.changeKey = chgEl.value;
+  };
+
+  document.getElementById('mSpawnCwd')?.addEventListener('input', (e) => {
+    state.spawnDraft.cwd = e.target.value;
+  });
+  document.getElementById('mSpawnPrompt')?.addEventListener('input', (e) => {
+    state.spawnDraft.prompt = e.target.value;
+  });
+  document.getElementById('mSpawnModel')?.addEventListener('change', (e) => {
+    state.spawnDraft.model = e.target.value;
+  });
+  document.getElementById('mSpawnTaskId')?.addEventListener('input', (e) => {
+    state.spawnDraft.taskId = e.target.value;
+  });
+  document.getElementById('mSpawnChange')?.addEventListener('input', (e) => {
+    state.spawnDraft.changeKey = e.target.value;
+  });
+
+  document.querySelectorAll('[data-pick-backend]').forEach((el) =>
+    el.addEventListener('click', () => {
+      syncSpawnTextFields();
+      const target = el.dataset.pickBackend;
+      if (target === 'go_settings') {
+        state.modal = null;
+        state.activeTab = 'settings';
+        render();
+        return;
+      }
+      state.spawnDraft.backend = target;
+      state.spawnDraft.model = 'auto';
+      render();
+    })
+  );
+
+  document.querySelectorAll('[data-spawn-quality]').forEach((el) =>
+    el.addEventListener('click', () => {
+      syncSpawnTextFields();
+      state.spawnDraft.quality = el.dataset.spawnQuality;
+      render();
+    })
+  );
+
+  document.querySelectorAll('[data-spawn-diff]').forEach((el) =>
+    el.addEventListener('click', () => {
+      syncSpawnTextFields();
+      state.spawnDraft.difficulty = el.dataset.spawnDiff;
+      render();
+    })
+  );
+
+  document.querySelectorAll('[data-spawn-iso]').forEach((el) =>
+    el.addEventListener('click', () => {
+      syncSpawnTextFields();
+      state.spawnDraft.isolation = el.dataset.spawnIso;
+      render();
+    })
+  );
+
+  document.getElementById('btnToggleSpawnAdv')?.addEventListener('click', () => {
+    syncSpawnTextFields();
+    state.spawnDraft.showAdvanced = !state.spawnDraft.showAdvanced;
+    render();
+  });
+
+  document.getElementById('btnJumpSettingsFromSpawn')?.addEventListener('click', () => {
+    syncSpawnTextFields();
+    state.modal = null;
+    state.activeTab = 'settings';
+    render();
+  });
+
   document.getElementById('btnSubmitSpawn')?.addEventListener('click', async () => {
     try {
-      const backend = document.getElementById('mSpawnBackend')?.value || 'codex';
-      const modelVal = document.getElementById('mSpawnModel')?.value?.trim();
+      syncSpawnTextFields();
+      const zEnabled = state.engineSettings?.config?.zcode?.enabled !== false;
+      const backend = !zEnabled && state.spawnDraft.backend === 'zcode' ? 'codex' : state.spawnDraft.backend;
+      const modelVal = state.spawnDraft.model?.trim();
+      const promptVal = state.spawnDraft.prompt?.trim();
+      const cwdVal = state.spawnDraft.cwd?.trim();
+      if (!cwdVal) return showToast('请填写工作目录', 'error');
+      if (!promptVal) return showToast('请填写任务指令', 'error');
+
       const res = await callTool('spawn_codex_worker', {
-        cwd: document.getElementById('mSpawnCwd')?.value?.trim(),
-        prompt: document.getElementById('mSpawnPrompt')?.value?.trim(),
+        cwd: cwdVal,
+        prompt: promptVal,
         backend,
         model: modelVal && modelVal !== 'auto' ? modelVal : undefined,
-        quality: document.getElementById('mSpawnQuality')?.value,
-        difficulty: document.getElementById('mSpawnDiff')?.value,
-        isolation: document.getElementById('mSpawnIso')?.value,
-        taskId: document.getElementById('mSpawnTaskId')?.value?.trim() || undefined,
-        changeKey: document.getElementById('mSpawnChange')?.value?.trim() || undefined,
+        quality: state.spawnDraft.quality,
+        difficulty: state.spawnDraft.difficulty,
+        isolation: state.spawnDraft.isolation,
+        taskId: state.spawnDraft.taskId?.trim() || undefined,
+        changeKey: state.spawnDraft.changeKey?.trim() || undefined,
       });
       state.modal = null;
+      state.spawnDraft.prompt = '';
+      state.spawnDraft.taskId = '';
       state.activeTab = 'subagents';
       state.narrowView = 'list';
-      showToast('已启动');
+      showToast(`已启动 ${backend === 'zcode' ? 'ZCode' : 'Codex'} 子代理`);
       await refreshSnapshot({ silent: true });
       if (res?.op?.id) pollOp(res.op.id, null);
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
+
+  // Settings Workspace Events
+  const collectSettingsForm = () => {
+    const cur = state.engineSettings?.config || {};
+    const routes = JSON.parse(JSON.stringify(cur.zcode?.routes || {}));
+    document.querySelectorAll('[data-route-key]').forEach((el) => {
+      const k = el.dataset.routeKey;
+      const slot = el.dataset.routeSlot;
+      if (!routes[k]) routes[k] = {};
+      routes[k][slot] = el.value;
+    });
+
+    const customAgents = JSON.parse(JSON.stringify(cur.customAgents || []));
+    document.querySelectorAll('[data-custom-agent-idx]').forEach((el) => {
+      const idx = Number(el.dataset.customAgentIdx);
+      const field = el.dataset.customField;
+      if (!customAgents[idx]) return;
+      customAgents[idx][field] = el.type === 'checkbox' ? el.checked : el.value.trim();
+    });
+
+    const zBtn = document.getElementById('btnToggleZcodeEnabled');
+    const zEnabled = zBtn ? zBtn.dataset.active === 'true' : cur.zcode?.enabled !== false;
+
+    return {
+      codex: {
+        required: true,
+        enabled: true,
+        flagshipModel: document.getElementById('cfgCodexFlagship')?.value || 'auto',
+        fastModel: document.getElementById('cfgCodexFast')?.value || 'auto',
+        defaultEffort: document.getElementById('cfgCodexEffort')?.value || 'xhigh',
+        defaultIsolation: document.getElementById('cfgCodexIsolation')?.value || 'worktree',
+        binPath: document.getElementById('cfgCodexBin')?.value?.trim() || '',
+      },
+      zcode: {
+        required: false,
+        enabled: zEnabled,
+        scriptPath: document.getElementById('cfgZcodeScript')?.value?.trim() || '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs',
+        defaultEffort: document.getElementById('cfgZcodeEffort')?.value || 'max',
+        syncDesktopIndex: Boolean(document.getElementById('cfgZcodeSyncDesktop')?.checked),
+        routes,
+      },
+      customAgents,
+      policy: {
+        reviewPolicy: document.getElementById('cfgPolicyReview')?.value || 'heterogeneous',
+        costStrategy: document.getElementById('cfgPolicyCost')?.value || 'effect_first',
+        hideDisabledEngineTasks: Boolean(document.getElementById('cfgHideDisabledTasks')?.checked),
+      },
+    };
+  };
+
+  document.getElementById('btnToggleZcodeEnabled')?.addEventListener('click', async () => {
+    const curEnabled = state.engineSettings?.config?.zcode?.enabled !== false;
+    const patch = collectSettingsForm();
+    patch.zcode.enabled = !curEnabled;
+    try {
+      const res = await callTool('console_engine_settings', { action: 'save', config: patch });
+      if (res?.engineSettings) state.engineSettings = res.engineSettings;
+      if (!patch.zcode.enabled && state.engineFilter === 'zcode') {
+        state.engineFilter = 'all';
+      }
+      await refreshSnapshot({ silent: true });
+      showToast(patch.zcode.enabled ? '已启用 ZCode 备选引擎' : '已停用 ZCode 备选引擎（仅使用 Codex）');
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
+
+  document.getElementById('btnSettingsSave')?.addEventListener('click', async () => {
+    if (state.savingSettings) return;
+    state.savingSettings = true;
+    const patch = collectSettingsForm();
+    render();
+    try {
+      const res = await callTool('console_engine_settings', { action: 'save', config: patch });
+      if (res?.engineSettings) state.engineSettings = res.engineSettings;
+      await refreshSnapshot({ silent: true });
+      showToast('引擎与路由配置已保存并同步');
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      state.savingSettings = false;
+      render();
+    }
+  });
+
+  document.getElementById('btnSettingsProbe')?.addEventListener('click', async () => {
+    try {
+      const res = await callTool('console_engine_settings', { action: 'probe' });
+      if (res?.engineSettings) state.engineSettings = res.engineSettings;
+      render();
+      const zCount = state.engineSettings?.discovery?.zcode?.flatModels?.length || 0;
+      const cCount = state.engineSettings?.discovery?.codex?.models?.length || 0;
+      showToast(`探测完成：Codex ${cCount} 模型 · ZCode ${zCount} 模型`);
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  });
+
+  document.getElementById('btnSettingsReset')?.addEventListener('click', async () => {
+    try {
+      const res = await callTool('console_engine_settings', { action: 'reset' });
+      if (res?.engineSettings) state.engineSettings = res.engineSettings;
+      await refreshSnapshot({ silent: true });
+      showToast('已恢复默认推荐配置');
     } catch (err) {
       showToast(err.message, 'error');
     }

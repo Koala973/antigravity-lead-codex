@@ -40,6 +40,9 @@ STATE_FILE = STATE_DIR / "state.json"
 LOCK_FILE = STATE_DIR / "state.lock"
 RUNS_DIR = STATE_DIR / "runs"
 WORKTREES_DIR = STATE_DIR / "worktrees"
+ENGINE_CONFIG_FILE = Path(
+    os.environ.get("AGY_ENGINE_CONFIG_FILE", str(STATE_DIR / "engine_config.json"))
+)
 
 ZCODE_HOME = Path(os.environ.get("ZCODE_HOME", os.path.expanduser("~/.zcode")))
 ZCODE_SCRIPT = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
@@ -420,6 +423,17 @@ def discover_frontier_models() -> dict[str, Any]:
     return best
 
 
+def load_engine_config() -> dict[str, Any]:
+    """Load user-configured engine & routing settings saved by Antigravity Lead Codex Settings page."""
+    if not ENGINE_CONFIG_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(ENGINE_CONFIG_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def discover_zcode_models() -> dict[str, Any]:
     """Inspect local ~/.zcode/v2/provider_config.json for configured providers and models."""
     cfg_path = Path(
@@ -514,6 +528,7 @@ def resolve_zcode_model_and_fallbacks(
 
     if use_wide:
         scenario = "wide_1m_context"
+        route_key = "wide_1m_context"
         base_chain = [
             (ZCODE_PROVIDER_TOKENHUB, "glm-5.3", "max", "腾讯TokenHub 100万窗口主选"),
             (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 一级热备"),
@@ -521,6 +536,7 @@ def resolve_zcode_model_and_fallbacks(
         ]
     elif is_code_heavy:
         scenario = "code_and_audit_flagship"
+        route_key = "code_and_audit"
         base_chain = [
             (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 多轮工具/代码审计主选(6.1s)"),
             (ZCODE_PROVIDER_BAILIAN, "deepseek-v4-pro-0813", "max", "阿里云百炼 深度代码一级热备(TTFT 2.2s)"),
@@ -529,6 +545,7 @@ def resolve_zcode_model_and_fallbacks(
         ]
     elif effective_difficulty in ("medium", "extreme"):
         scenario = "reasoning_and_business_flagship"
+        route_key = "reasoning_and_business"
         base_chain = [
             (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 综合/业务主选(6.1s)"),
             (ZCODE_PROVIDER_TOKENHUB, "kimi-k3", "max", "腾讯TokenHub 同模型一级热备"),
@@ -536,16 +553,30 @@ def resolve_zcode_model_and_fallbacks(
         ]
     else:
         scenario = "fast_tool_flagship"
+        route_key = "fast_tool_and_plugin"
         base_chain = [
             (ZCODE_PROVIDER_BAILIAN, "qwen3.8-max", "xhigh", "阿里云百炼 工具/轻量主选(7.8s)"),
             (ZCODE_PROVIDER_TOKENHUB, "deepseek-v4.1-flash", "max", "腾讯TokenHub 零报错一级热备"),
             (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 二级热备"),
         ]
 
+    engine_cfg = load_engine_config()
+    zcode_cfg = engine_cfg.get("zcode") if isinstance(engine_cfg.get("zcode"), dict) else {}
+    custom_routes = zcode_cfg.get("routes") if isinstance(zcode_cfg.get("routes"), dict) else {}
+    route_override = custom_routes.get(route_key) if isinstance(custom_routes.get(route_key), dict) else {}
+
+    discovered_z = discover_zcode_models()
+    dynamic_labels = dict(ZCODE_PROVIDER_LABELS)
+    for p in discovered_z.get("providers", []):
+        if isinstance(p, dict) and p.get("provider_id") and p.get("provider_name"):
+            dynamic_labels[str(p["provider_id"])] = str(p["provider_name"])
+
     chain: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
     def _add_candidate(pid: str, mid: str, eff: str, note: str) -> None:
+        if not pid or not mid:
+            return
         key = (pid, mid)
         if key in seen:
             return
@@ -553,7 +584,7 @@ def resolve_zcode_model_and_fallbacks(
         chain.append(
             {
                 "provider_id": pid,
-                "provider_label": ZCODE_PROVIDER_LABELS.get(pid, pid),
+                "provider_label": dynamic_labels.get(pid, pid),
                 "model_id": mid,
                 "full_model": f"{pid}/{mid}",
                 "effort": explicit_effort or eff,
@@ -561,7 +592,7 @@ def resolve_zcode_model_and_fallbacks(
             }
         )
 
-    if explicit_model and explicit_model.strip() and explicit_model.strip() != "zcode-default":
+    if explicit_model and explicit_model.strip() and explicit_model.strip() not in ("zcode-default", "auto"):
         raw_m = explicit_model.strip()
         if "/" in raw_m:
             pid, mid = raw_m.split("/", 1)
@@ -578,8 +609,28 @@ def resolve_zcode_model_and_fallbacks(
                 if raw_m in ("kimi-k3", "deepseek-v4-pro-0813"):
                     _add_candidate(ZCODE_PROVIDER_TOKENHUB, raw_m, eff, "用户显式指定模型(腾讯TokenHub同模热备)")
 
+    # Apply user-configured scenario route from Settings page if present
+    if route_override:
+        cfg_eff = str(route_override.get("effort") or zcode_cfg.get("defaultEffort") or "max")
+        for slot_key, slot_label in (
+            ("primary", "设置页主选模型"),
+            ("fallback1", "设置页一级热备"),
+            ("fallback2", "设置页二级热备"),
+        ):
+            val = str(route_override.get(slot_key) or "").strip()
+            if "/" in val:
+                pid, mid = val.split("/", 1)
+                _add_candidate(pid.strip(), mid.strip(), cfg_eff, slot_label)
+
     for pid, mid, eff, note in base_chain:
         _add_candidate(pid, mid, eff, note)
+
+    # Also append any user-discovered local ZCode provider models for universal portability
+    for p in discovered_z.get("providers", []):
+        pid = str(p.get("provider_id") or "").strip()
+        for mid in p.get("models", []):
+            eff = "xhigh" if "qwen" in str(mid) else "max"
+            _add_candidate(pid, str(mid).strip(), eff, "本机自动发现渠道兜底")
 
     primary = chain[0]
     return {
@@ -2233,14 +2284,22 @@ def cmd_review(args: argparse.Namespace) -> int:
     base_sha = args.base or (task_record.get("base_sha") if task_record else None)
     git_truth = collect_git_truth(workdir, base_sha)
 
-    # Heterogeneous cross-engine review when --backend auto is used
+    # Heterogeneous cross-engine review when --backend auto is used (respecting optional ZCode toggle)
+    engine_cfg = load_engine_config()
+    zcode_cfg = engine_cfg.get("zcode") if isinstance(engine_cfg.get("zcode"), dict) else {}
+    policy_cfg = engine_cfg.get("policy") if isinstance(engine_cfg.get("policy"), dict) else {}
+    zcode_enabled = bool(zcode_cfg.get("enabled", True)) and bool(get_node_bin()) and ZCODE_SCRIPT.exists()
+    review_policy = str(policy_cfg.get("reviewPolicy") or "heterogeneous")
+
     author_backend = task_record.get("backend") if task_record else None
     if args.backend == "auto":
-        if author_backend == "codex" and get_node_bin() and ZCODE_SCRIPT.exists():
+        if review_policy == "codex_only" or not zcode_enabled:
+            backend = "codex"
+        elif author_backend == "codex" and zcode_enabled:
             backend = "zcode"
         elif author_backend == "zcode" and get_codex_bin():
             backend = "codex"
-        elif get_node_bin() and ZCODE_SCRIPT.exists():
+        elif zcode_enabled:
             backend = "zcode"
         else:
             backend = "codex"

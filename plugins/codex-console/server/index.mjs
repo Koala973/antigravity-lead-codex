@@ -10,6 +10,11 @@ import { ConsoleDB } from './console-db.mjs';
 import { CodexStore } from './codex-store.mjs';
 import { CodexRunner, DIAGNOSE_BLOCKER_PROMPT, buildExecEnv } from './runner.mjs';
 import { QuotaTracker } from './quota.mjs';
+import {
+  getEngineDiscoverySnapshot,
+  saveEngineConfig,
+  resetEngineConfig,
+} from './engine-config.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -121,7 +126,7 @@ server.registerTool(
     description:
       '打开 Antigravity 侧栏「Antigravity Lead Codex」双引擎可视化控制台，查看本地 Codex CLI / Desktop 与 ZCode 国模任务、隔离 Worktree 受管子代理与跨会话 Change 绑定，并支持只读诊断与排队唤醒。',
     inputSchema: {
-      tab: z.enum(['tasks', 'subagents', 'collab']).optional().describe('初始激活页签'),
+      tab: z.enum(['tasks', 'subagents', 'collab', 'settings']).optional().describe('初始激活页签'),
       threadId: z.string().optional().describe('默认聚焦的 Codex 或 ZCode 会话 ID'),
       query: z.string().optional().describe('初始搜索关键字'),
     },
@@ -431,11 +436,46 @@ server.registerTool(
   async ({ limit = 160 } = {}) => {
     const snap = store.getSnapshot({ limit });
     const quota = quotaTracker.getFastQuota();
+    const engineSettings = getEngineDiscoverySnapshot();
     return ok('snapshot ok', {
       ...snap,
       quota,
       runtime: runner.getRuntimeInfo(),
+      engineSettings,
     });
+  }
+);
+
+server.registerTool(
+  'console_engine_settings',
+  {
+    title: '管理引擎接入与路由配置',
+    description:
+      '查询、保存、探测或重置 Antigravity Lead Codex 的引擎配置（Codex 必选核心引擎 + ZCode / 其他备选 Agent 可选开关、渠道模型发现、四大场景主备路由表与异构交叉审查策略）。',
+    inputSchema: {
+      action: z.enum(['get', 'save', 'reset', 'probe']).optional().describe('操作类型：默认 get'),
+      config: z.record(z.any()).optional().describe('action=save 时传入的配置补丁（codex / zcode / customAgents / policy）'),
+    },
+    _meta: BOTH_META,
+  },
+  async ({ action = 'get', config = {} } = {}) => {
+    try {
+      if (action === 'reset') {
+        resetEngineConfig();
+      } else if (action === 'save' && config && typeof config === 'object') {
+        saveEngineConfig(config);
+      }
+      const engineSettings = getEngineDiscoverySnapshot();
+      const zEnabled = engineSettings.config.zcode?.enabled;
+      const zProviders = engineSettings.discovery.zcode?.providers?.length || 0;
+      const zModels = engineSettings.discovery.zcode?.flatModels?.length || 0;
+      return ok(
+        `引擎配置已同步（Codex: 必选已启用 | ZCode: ${zEnabled ? `已启用 [${zProviders} 渠道 / ${zModels} 模型]` : '已停用'} | 审查策略: ${engineSettings.config.policy?.reviewPolicy}）。`,
+        { engineSettings }
+      );
+    } catch (err) {
+      return fail(err.message || String(err));
+    }
   }
 );
 
