@@ -3,6 +3,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+const DEFAULT_UI_PREFS = Object.freeze({ uiStyle: 'minimal', catEnabled: true, catLinkTaskStatus: false });
+
+function validUiPref(key, value) {
+  if (key === 'uiStyle') return value === 'minimal' || value === 'glow';
+  return (key === 'catEnabled' || key === 'catLinkTaskStatus') && typeof value === 'boolean';
+}
+
 export class ConsoleDB {
   constructor(dataDir) {
     fs.mkdirSync(dataDir, { recursive: true });
@@ -12,6 +19,12 @@ export class ConsoleDB {
       PRAGMA journal_mode = WAL;
       PRAGMA busy_timeout = 3000;
       PRAGMA synchronous = NORMAL;
+
+      CREATE TABLE IF NOT EXISTS ui_prefs (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
 
       CREATE TABLE IF NOT EXISTS thread_prefs (
         thread_id TEXT PRIMARY KEY,
@@ -85,6 +98,44 @@ export class ConsoleDB {
           finished_at = COALESCE(finished_at, ?)
       WHERE status = 'running'
     `).run(now);
+  }
+
+  getUiPrefs() {
+    const prefs = { ...DEFAULT_UI_PREFS };
+    for (const { key, value } of this.db.prepare('SELECT key, value FROM ui_prefs').all()) {
+      const parsed = value === 'true' ? true : value === 'false' ? false : value;
+      if (validUiPref(key, parsed)) prefs[key] = parsed;
+    }
+    return prefs;
+  }
+
+  setUiPrefs(patch) {
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new TypeError('界面选项需要使用对象');
+    }
+    const entries = Object.entries(patch);
+    for (const [key, value] of entries) {
+      if (!validUiPref(key, value)) throw new TypeError(`无效的界面选项 ${key}`);
+    }
+    const write = this.db.prepare(`
+      INSERT INTO ui_prefs (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const now = Date.now();
+      for (const [key, value] of entries) write.run(key, String(value), now);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    return this.getUiPrefs();
+  }
+
+  resetUiPrefs() {
+    this.db.exec('DELETE FROM ui_prefs');
+    return this.getUiPrefs();
   }
 
   getAllPrefs() {

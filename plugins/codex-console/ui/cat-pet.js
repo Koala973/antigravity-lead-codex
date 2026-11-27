@@ -1,100 +1,70 @@
-/**
- * Original MIT-licensed minimal pixel-art violet cat pet for Codex Console.
- * Clean-room 14x11 pixel grid rendered as crisp inline SVG + CSS keyframes.
- *
- * States:
- *  - 'working'   : briskly paces left <-> right across the runway with sparkle
- *  - 'strolling' : leisurely walks left <-> right for ~12 min after finishing work
- *  - 'sleeping'  : curls down with closed eyes & floating 'z Z z' after 12+ min idle
- *  - 'blocked'   : pauses alertly with a bouncing amber '!' indicator
- *  - 'meowing'   : triggered on click — stops, opens tiny mouth, pops '喵~' bubble
- */
+// Each SVG unit is one pixel of the original 16 × 13 sprite.
+const BODY = '#927CE5';
+const PAW = '#725EC8';
+const INK = '#181820';
+const BLUSH = '#F472B6';
 
-export function renderPixelCat({
-  mode = 'sleeping',
-  label = '',
-  meowing = false,
-  freezeLeft = null,
-  freezeFlip = 1,
-}) {
-  const effectiveMode = meowing
-    ? 'meowing'
-    : ['working', 'strolling', 'blocked', 'sleeping'].includes(mode)
-      ? mode
-      : 'sleeping';
+function rect(x, y, width = 1, height = 1, color = BODY) {
+  return `<rect x="${x}" y="${y}" width="${width}" height="${height}" fill="${color}"/>`;
+}
 
-  const eyesOpen = effectiveMode !== 'sleeping';
-  const walkerStyle =
-    meowing && typeof freezeLeft === 'number'
-      ? `style="left:${freezeLeft.toFixed(1)}px"`
-      : '';
-  const svgStyle =
-    meowing && (freezeFlip === -1 || freezeFlip === 1)
-      ? `style="transform:scaleX(${freezeFlip})"`
-      : '';
-
-  const eyesSvg = eyesOpen
-    ? `
-      <rect x="4" y="4" width="1.2" height="2" fill="#18122b"/>
-      <rect x="8.8" y="4" width="1.2" height="2" fill="#18122b"/>
-    `
-    : `
-      <rect x="3.7" y="5" width="2.1" height="0.9" fill="#18122b"/>
-      <rect x="8.2" y="5" width="2.1" height="0.9" fill="#18122b"/>
-    `;
-
-  const mouthSvg = meowing
-    ? `<rect x="6.4" y="6.1" width="1.2" height="1.1" fill="#ec4899"/>`
-    : '';
-
-  let overlay = '';
-  if (meowing) {
-    overlay = `<span class="cat-meow" aria-hidden="true">喵~</span>`;
-  } else if (effectiveMode === 'blocked') {
-    overlay = `<span class="cat-badge blocked" aria-hidden="true">!</span>`;
-  } else if (effectiveMode === 'working') {
-    overlay = `<span class="cat-badge spark" aria-hidden="true">✦</span>`;
-  } else if (effectiveMode === 'sleeping') {
-    overlay = `<span class="cat-zzz" aria-hidden="true"><span>z</span><span>Z</span><span>z</span></span>`;
+function face(mode) {
+  if (mode === 'happy') {
+    const smile = x => rect(x, 5, 1, 1, INK) + rect(x + 1, 4, 1, 1, INK) + rect(x + 2, 5, 1, 1, INK);
+    return smile(2) + smile(8) + rect(1, 6, 1, 1, BLUSH) + rect(11, 6, 1, 1, BLUSH);
   }
+  if (mode === 'angry') {
+    return rect(2, 4, 1, 1, INK) + rect(3, 5, 2, 1, INK) + rect(8, 5, 2, 1, INK) + rect(10, 4, 1, 1, INK);
+  }
+  if (mode === 'shake') {
+    return rect(2, 5, 2, 1, INK) + rect(9, 4, 2, 1, INK);
+  }
+  if (mode === 'sleeping') {
+    return rect(2, 5, 2, 1, INK) + rect(8, 5, 2, 1, INK);
+  }
+  return rect(2, 4, 1, 2, INK) + rect(9, 4, 1, 2, INK);
+}
 
+function legs(xs) {
+  return xs.map(x => rect(x, 9) + rect(x, 10, 1, 1, PAW)).join('');
+}
+
+const bubbles = { hop: '喵~', happy: '♥', shake: '哼!', angry: '💢 别戳啦!' };
+
+function overlay(mode) {
+  if (Object.hasOwn(bubbles, mode)) {
+    return `<span class="cat-meow" aria-hidden="true">${bubbles[mode]}</span>`;
+  }
+  if (mode === 'sleeping') {
+    return '<span class="cat-zzz" aria-hidden="true"><span>z</span><span>Z</span><span>z</span></span>';
+  }
+  if (mode === 'working') return '<span class="cat-badge spark" aria-hidden="true">✦</span>';
+  if (mode === 'blocked') return '<span class="cat-badge blocked" aria-hidden="true">!</span>';
+  return '';
+}
+
+export function renderPixelCat({ mode = 'strolling', reaction, label = '点击像素小猫', freezeLeft, freezeFlip }) {
+  const reacting = Object.hasOwn(bubbles, reaction);
+  const pose = reacting ? reaction : ['working', 'blocked', 'sleeping'].includes(mode) ? mode : 'strolling';
+  const walkerStyle = reacting && Number.isFinite(freezeLeft) ? `style="left:${freezeLeft}px"` : '';
+  const facingStyle = reacting ? `style="transform:scaleX(${freezeFlip === -1 ? -1 : 1})"` : '';
+  const name = String(label).replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
   return `
-    <button
-      type="button"
-      class="cat-runway mode-${effectiveMode} tip-trigger tip-bottom-right"
-      id="btnCatPet"
-      data-tip="${label}"
-      aria-label="${label}"
-    >
+    <button type="button" id="btnCatPet" class="cat-runway mode-${pose} tip-trigger tip-bottom-right"
+            data-tip="${name}" aria-label="${name}">
       <span class="cat-walker" ${walkerStyle}>
-        ${overlay}
-        <svg class="cat-svg" ${svgStyle} viewBox="0 0 14 11" width="23" height="18" shape-rendering="crispEdges" aria-hidden="true">
-          <rect x="2" y="0" width="2" height="2" fill="#8b7be8"/>
-          <rect x="10" y="0" width="2" height="2" fill="#8b7be8"/>
-          <rect x="2" y="0" width="1" height="1" fill="#b4a7fa"/>
-          <rect x="11" y="0" width="1" height="1" fill="#b4a7fa"/>
-          <rect x="2" y="2" width="10" height="6" fill="#8b7be8"/>
-          <rect x="1" y="3" width="1" height="4" fill="#7c6be0"/>
-          <rect x="12" y="3" width="1" height="4" fill="#7c6be0"/>
-          <rect x="3" y="2" width="8" height="1" fill="#a89bf7"/>
-          <rect x="13" y="5" width="1" height="2" fill="#7c6be0"/>
-          ${eyesSvg}
-          ${mouthSvg}
-          <g class="cat-legs-a">
-            <rect x="3" y="8" width="1.5" height="2" fill="#7160d6"/>
-            <rect x="5.5" y="8" width="1.5" height="2" fill="#7160d6"/>
-            <rect x="8.5" y="8" width="1.5" height="2" fill="#7160d6"/>
-            <rect x="10.5" y="8" width="1.5" height="2" fill="#7160d6"/>
-          </g>
-          <g class="cat-legs-b">
-            <rect x="2.4" y="8" width="1.5" height="1.6" fill="#7160d6"/>
-            <rect x="5.8" y="8" width="1.5" height="2.2" fill="#7160d6"/>
-            <rect x="8.2" y="8" width="1.5" height="2.2" fill="#7160d6"/>
-            <rect x="10.8" y="8" width="1.5" height="1.6" fill="#7160d6"/>
-          </g>
-        </svg>
+        ${overlay(pose)}
+        <span class="cat-facing" ${facingStyle}>
+          <svg class="cat-svg" viewBox="0 0 16 13" width="26" height="21" shape-rendering="crispEdges" aria-hidden="true">
+            <rect x="1" y="11" width="12" height="1" fill="var(--cat-shadow)"/>
+            ${rect(1, 0)}${rect(1, 1, 2)}${rect(12, 0)}${rect(11, 1, 2)}
+            ${rect(1, 2, 12, 7)}
+            <g class="cat-tail">${rect(13, 6, 1, 1, PAW)}${rect(13, 7)}${rect(14, 4, 1, 3)}</g>
+            ${face(pose)}
+            <g class="cat-legs-a">${legs([2, 4, 9, 11])}</g>
+            <g class="cat-legs-b">${legs([1, 5, 8, 12])}</g>
+          </svg>
+        </span>
       </span>
-      <span class="cat-floor" aria-hidden="true"></span>
-    </button>
-  `;
+    </button>`;
 }

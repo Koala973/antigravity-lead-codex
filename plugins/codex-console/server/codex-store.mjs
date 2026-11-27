@@ -1,20 +1,11 @@
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadEngineConfig, discoverZcodeEnvironment, dispatchStateDir, expandPath } from './engine-config.mjs';
+import os from 'node:os';
 
-const ZCODE_PROVIDER_SHORT = {
-  'qwen-alibaba-model-studio-cn': '百炼',
-  'e2a41300-b652-45ec-9f78-ebd2ec7889be': 'TokenHub',
-};
-
-function formatZcodeModelDisplay(rawModel, providerLabels) {
-  if (!rawModel) return 'zcode';
-  const s = String(rawModel).trim();
-  if (!s.includes('/')) return s;
-  const [prov, mod] = s.split('/', 2);
-  const shortProv = ZCODE_PROVIDER_SHORT[prov] || providerLabels?.[prov];
-  return shortProv ? `${shortProv}/${mod}` : mod || s;
+function stateDir(configured, defaultDir) {
+  const value = configured || defaultDir;
+  return value === '~' ? os.homedir() : value.startsWith('~/') ? path.join(os.homedir(), value.slice(2)) : value;
 }
 
 function withReadOnlyDb(dbFile, fn, fallback) {
@@ -37,8 +28,7 @@ function withReadOnlyDb(dbFile, fn, fallback) {
   }
 }
 
-function readDispatchState() {
-  const statePath = path.join(dispatchStateDir(), 'state.json');
+function readDispatchState(statePath) {
   if (!fs.existsSync(statePath)) return { tasks: {} };
   try {
     const raw = JSON.parse(fs.readFileSync(statePath, 'utf8'));
@@ -72,10 +62,6 @@ function readDispatchRunResult(runDir) {
     if (result) return result;
   }
   return null;
-}
-
-function dispatchBackend(task) {
-  return task.backend || (task.session_id?.startsWith('sess_') ? 'zcode' : 'codex');
 }
 
 function dispatchMessages(record, task) {
@@ -235,11 +221,11 @@ function extractTextFromItem(itemType, itemJson) {
 function computeEffectiveStatus({ thread, goal, latestTurn, dispatchTask }) {
   const dispatchTerminal =
     dispatchTask &&
-    ['completed', 'failed', 'cleaned', 'cancelled', 'timed_out', 'stopped'].includes(
+    ['completed', 'failed', 'cleaned', 'cancelled', 'timed_out', 'stopped', 'partial', 'blocked'].includes(
       dispatchTask.status
     );
 
-  if (latestTurn?.status === 'inProgress' && !dispatchTerminal) {
+  if (!dispatchTerminal && (latestTurn?.status === 'inProgress' || dispatchTask?.status === 'running')) {
     return { code: 'running', label: '运行中', tone: 'info' };
   }
   if (goal?.status === 'blocked') {
@@ -283,376 +269,66 @@ function computeEffectiveStatus({ thread, goal, latestTurn, dispatchTask }) {
   if (thread.source === 'exec' || dispatchTask?.status === 'completed') {
     return { code: 'exec_done', label: 'CLI 已完成', tone: 'success' };
   }
-  if (thread.task_status === 'completed' || thread.last_outcome === 'completed') {
-    return { code: 'complete', label: '已完成', tone: 'success' };
-  }
-  if (thread.task_status === 'running') {
-    return { code: 'running', label: '运行中', tone: 'info' };
-  }
-  if (thread.task_status === 'failed' || thread.last_outcome === 'failed') {
-    return { code: 'failed', label: '执行异常', tone: 'danger' };
-  }
   return { code: 'idle', label: '就绪', tone: 'muted' };
 }
 
 export class CodexStore {
   constructor(consoleDb) {
     this.consoleDb = consoleDb;
-    this.codexHome = expandPath(process.env.CODEX_HOME || '~/.codex');
-    this.zcodeHome = expandPath(process.env.ZCODE_HOME || '~/.zcode');
+    this.codexHome = stateDir(process.env.CODEX_HOME, '~/.codex');
+    this.dispatchFile = path.join(stateDir(process.env.AGY_DISPATCH_STATE_DIR, '~/.local/state/multi-agent-dispatch'), 'state.json');
     this.stateDbPath = path.join(this.codexHome, 'state_5.sqlite');
     this.goalsDbPath = path.join(this.codexHome, 'goals_1.sqlite');
     this.queueDbPath = path.join(this.codexHome, 'queue_1.sqlite');
     this.historyDbPath = path.join(this.codexHome, 'thread_history_1.sqlite');
-    this.zcodeCliDbPath = path.join(this.zcodeHome, 'cli', 'db', 'db.sqlite');
-    this.zcodeTasksIndexDbPath = path.join(this.zcodeHome, 'v2', 'tasks-index.sqlite');
   }
 
   getHealth() {
     return {
       codexHome: this.codexHome,
-      zcodeHome: this.zcodeHome,
       stateDbExists: fs.existsSync(this.stateDbPath),
       goalsDbExists: fs.existsSync(this.goalsDbPath),
       queueDbExists: fs.existsSync(this.queueDbPath),
       historyDbExists: fs.existsSync(this.historyDbPath),
-      zcodeCliDbExists: fs.existsSync(this.zcodeCliDbPath),
-      zcodeTasksIndexDbExists: fs.existsSync(this.zcodeTasksIndexDbPath),
-      dispatchStateExists: fs.existsSync(path.join(dispatchStateDir(), 'state.json')),
+      dispatchStateExists: fs.existsSync(this.dispatchFile),
     };
   }
 
-  _loadZcodeTasks({ limit = 100, prefsMap, dispatchBySession, opsByThread, bindingsByThread, engine, providerLabels }) {
-    const idxData = withReadOnlyDb(
-      this.zcodeTasksIndexDbPath,
-      (db) => {
-        const projects = db
-          .prepare('SELECT project_id, name FROM projects WHERE deleted = 0')
-          .all();
-        const roots = db
-          .prepare('SELECT project_id, root_path FROM project_roots')
-          .all();
-        const indexedTasks = db
-          .prepare(
-            `SELECT workspace_path, task_id, title, cli_title, task_status, mode, model,
-                    created_at, updated_at, pinned, archived, deleted, cli_deleted,
-                    searchable_text, project_id, root_path, worktree_root
-             FROM tasks
-             WHERE deleted = 0 AND COALESCE(cli_deleted, 0) = 0 AND task_id LIKE 'sess_%'
-             ORDER BY updated_at DESC
-             LIMIT ?`
-          )
-          .all(limit);
-        return { projects, roots, indexedTasks };
-      },
-      { projects: [], roots: [], indexedTasks: [] }
-    );
-
-    const zProjectsById = new Map(idxData.projects.map((p) => [p.project_id, p.name]));
-    const zProjectRoots = idxData.roots
-      .map((r) => ({
-        path: r.root_path,
-        projectName: zProjectsById.get(r.project_id) || path.basename(r.root_path || ''),
-      }))
-      .sort((a, b) => b.path.length - a.path.length);
-
-    const indexedById = new Map();
-    for (const row of idxData.indexedTasks) {
-      if (row.task_id) indexedById.set(row.task_id, row);
-    }
-
-    // Collect candidate ZCode session IDs: all indexed Desktop tasks + all dispatch-tracked ZCode sessions
-    const targetSessionIds = new Set(indexedById.keys());
-    for (const [sid, dt] of dispatchBySession.entries()) {
-      if (dispatchBackend(dt) === 'zcode') {
-        targetSessionIds.add(sid);
-      }
-    }
-
-    const cliSessionsMap = new Map();
-    const cliUsageMap = new Map();
-    const cliReplyMap = new Map();
-    const cliRunningSet = new Set();
-
-    withReadOnlyDb(
-      this.zcodeCliDbPath,
-      (db) => {
-        // Also check active runtime presence (only if the OS process is actually alive)
-        try {
-          const pres = db.prepare('SELECT session_id, process_id FROM session_runtime_presence').all();
-          for (const p of pres) {
-            if (!p.session_id) continue;
-            let alive = false;
-            if (p.process_id && Number(p.process_id) > 0) {
-              try {
-                process.kill(Number(p.process_id), 0);
-                alive = true;
-              } catch {
-                alive = false;
-              }
-            }
-            if (alive) {
-              cliRunningSet.add(p.session_id);
-              targetSessionIds.add(p.session_id);
-            }
-          }
-        } catch {
-          // ignore if table absent
-        }
-
-        // If tasks-index.sqlite didn't exist, fall back to recent sessions from cli/db/db.sqlite
-        if (targetSessionIds.size === 0) {
-          const recentRows = db
-            .prepare(
-              `SELECT id FROM session WHERE time_deleted IS NULL ORDER BY time_updated DESC LIMIT ?`
-            )
-            .all(Math.min(40, limit));
-          for (const r of recentRows) {
-            if (r.id) targetSessionIds.add(r.id);
-          }
-        }
-
-        const sids = [...targetSessionIds];
-        if (!sids.length) return;
-        const ph = sids.map(() => '?').join(',');
-
-        const srows = db
-          .prepare(
-            `SELECT id, directory, path, title, time_created, time_updated, time_archived, time_deleted, last_outcome
-             FROM session
-             WHERE id IN (${ph})`
-          )
-          .all(...sids);
-        for (const r of srows) {
-          cliSessionsMap.set(r.id, r);
-        }
-
-        const urows = db
-          .prepare(
-            `SELECT session_id, provider_id, model_id, variant,
-                    SUM(COALESCE(computed_total_tokens, provider_total_tokens, input_tokens + output_tokens, 0)) AS total_tok,
-                    SUM(COALESCE(duration_ms, 0)) AS total_dur_ms,
-                    MAX(started_at) AS last_started
-             FROM model_usage
-             WHERE session_id IN (${ph})
-             GROUP BY session_id`
-          )
-          .all(...sids);
-        for (const u of urows) {
-          cliUsageMap.set(u.session_id, u);
-        }
-
-        // Fetch latest model per session
-        const latestModelRows = db
-          .prepare(
-            `SELECT mu.session_id, mu.provider_id, mu.model_id, mu.variant
-             FROM model_usage mu
-             INNER JOIN (
-               SELECT session_id, MAX(started_at) AS max_st
-               FROM model_usage
-               WHERE session_id IN (${ph})
-               GROUP BY session_id
-             ) latest ON mu.session_id = latest.session_id AND mu.started_at = latest.max_st`
-          )
-          .all(...sids);
-        for (const lm of latestModelRows) {
-          const cur = cliUsageMap.get(lm.session_id) || {};
-          cliUsageMap.set(lm.session_id, {
-            ...cur,
-            provider_id: lm.provider_id,
-            model_id: lm.model_id,
-            variant: lm.variant,
-          });
-        }
-      },
-      null
-    );
-
-    const zcodeTasks = [];
-    for (const sid of targetSessionIds) {
-      const idxRow = indexedById.get(sid) || null;
-      const cliRow = cliSessionsMap.get(sid) || null;
-      const dispatchTask = dispatchBySession.get(sid) || null;
-      if (!idxRow && !cliRow) continue;
-      if (cliRow?.time_deleted) continue;
-
-      const pref = prefsMap.get(sid) || null;
-      const usage = cliUsageMap.get(sid) || null;
-      const cwd =
-        dispatchTask?.workdir ||
-        idxRow?.workspace_path ||
-        cliRow?.directory ||
-        cliRow?.path ||
-        '';
-      const rawModel =
-        (usage?.provider_id && usage?.model_id ? `${usage.provider_id}/${usage.model_id}` : '') ||
-        idxRow?.model ||
-        dispatchTask?.model ||
-        'zcode';
-      const displayModel = formatZcodeModelDisplay(rawModel, providerLabels);
-
-      const parsedUpdated = dispatchTask?.updated_at ? Date.parse(dispatchTask.updated_at) : NaN;
-      const updatedMs = Number(
-        idxRow?.updated_at ||
-          cliRow?.time_updated ||
-          (Number.isFinite(parsedUpdated) ? parsedUpdated : Date.now())
-      );
-      const parsedCreated = dispatchTask?.created_at ? Date.parse(dispatchTask.created_at) : NaN;
-      const createdMs = Number(
-        idxRow?.created_at ||
-          cliRow?.time_created ||
-          (Number.isFinite(parsedCreated) ? parsedCreated : updatedMs)
-      );
-
-      const isManagedDispatch = Boolean(dispatchTask);
-      const isRunning = cliRunningSet.has(sid) || dispatchTask?.status === 'running';
-      const status = computeEffectiveStatus({
-        thread: {
-          archived: Boolean(idxRow?.archived || cliRow?.time_archived),
-          source: isManagedDispatch ? 'exec' : 'zcode_desktop',
-          task_status: isRunning ? 'running' : idxRow?.task_status || cliRow?.last_outcome,
-          last_outcome: cliRow?.last_outcome || idxRow?.task_status,
-        },
-        goal: null,
-        latestTurn: isRunning ? { status: 'inProgress' } : null,
-        dispatchTask,
-      });
-
-      const projectName = deriveProjectName(
-        { project_id: idxRow?.project_id, cwd },
-        zProjectsById,
-        zProjectRoots,
-        dispatchTask
-      );
-      const worktreeLabel = parseWorktreeLabel(cwd || dispatchTask?.worktree_path || idxRow?.worktree_root);
-
-      const dispatchResult = dispatchTask ? readDispatchRunResult(dispatchTask.run_dir) : null;
-      const searchLines = (idxRow?.searchable_text || '')
-        .split('\n')
-        .map((l) => l.trim())
-        .filter(Boolean);
-      const previewText =
-        dispatchResult?.report?.summary ||
-        (searchLines.length > 1 ? searchLines[searchLines.length - 1] : searchLines[0] || '');
-
-      const title = cleanDisplayTitle({
-        customTitle: pref?.customTitle,
-        threadName: idxRow?.title || idxRow?.cli_title,
-        dispatchTask,
-        rawTitle: cliRow?.title || idxRow?.title,
-        preview: previewText,
-        agentNickname: null,
-        agentPath: null,
-        id: sid,
-      });
-
-      const threadBindings = bindingsByThread.get(sid) || [];
-      const threadOps = opsByThread.get(sid) || [];
-      const pinned = pref ? pref.pinned : Boolean(idxRow?.pinned);
-
-      zcodeTasks.push({
-        id: sid,
-        shortId: sid.replace(/^sess_/, '').slice(0, 8),
-        engine: 'zcode',
-        engineLabel: engine.name,
-        title,
-        customTitle: pref?.customTitle || null,
-        rawTitle: (cliRow?.title || idxRow?.title || title).slice(0, 400),
-        projectName,
-        worktreeLabel,
-        cwd,
-        branch: dispatchTask?.branch || '',
-        model: displayModel,
-        rawModel,
-        reasoningEffort: usage?.variant || dispatchTask?.effort || 'max',
-        source: isManagedDispatch ? 'exec' : 'zcode_desktop',
-        originator: isManagedDispatch ? 'zcode_exec' : 'zcode_desktop',
-        isExec: isManagedDispatch,
-        isManagedDispatch,
-        isAgyDispatched: isManagedDispatch,
-        isSubagent: false,
-        parentThreadId: null,
-        childCount: 0,
-        agentNickname: null,
-        agentRole: null,
-        pinned,
-        pinnedAt: pref?.pinnedAt || null,
-        hidden: Boolean(pref?.hidden),
-        archived: Boolean(idxRow?.archived || cliRow?.time_archived),
-        tokensUsed: Number(usage?.total_tok || 0),
-        durationSec: Math.round(Number(usage?.total_dur_ms || Math.max(0, updatedMs - createdMs)) / 1000),
-        createdAtMs: createdMs,
-        updatedAtMs: updatedMs,
-        status,
-        goal: null,
-        queuedCount: 0,
-        latestReply: unwrapStructuredReply(previewText).replace(/\s+/g, ' ').trim().slice(0, 220),
-        latestTurnStatus: isRunning ? 'inProgress' : 'completed',
-        dispatchTask: dispatchTask
-          ? {
-              taskId: dispatchTask.task_id,
-              backend: 'zcode',
-              status: dispatchTask.status,
-              difficulty: dispatchTask.difficulty,
-              branch: dispatchTask.branch,
-              worktreePath: dispatchTask.worktree_path,
-              repoRoot: dispatchTask.repo_root,
-              isolation: dispatchTask.isolation,
-              sandbox: dispatchTask.sandbox,
-              exitCode: dispatchTask.exit_code,
-            }
-          : null,
-        bindingCount: threadBindings.length,
-        changeKeys: threadBindings.map((b) => b.changeKey),
-        runningOpsCount: threadOps.filter((o) => o.status === 'running').length,
-      });
-    }
-
-    return zcodeTasks;
-  }
-
-  getSnapshot({ limit = 160 } = {}) {
+  getSnapshot({ limit = 160, threadId = null } = {}) {
     const prefsMap = this.consoleDb.getAllPrefs();
-    const dispatchState = readDispatchState();
-    const engineConfig = loadEngineConfig();
-    const engineMap = new Map(engineConfig.engines.map(engine => [engine.id, engine]));
-    const visible = id => !engineConfig.policy.hideDisabledEngineTasks || engineMap.get(id)?.enabled;
+    const dispatchState = readDispatchState(this.dispatchFile);
     const dispatchTasksList = Object.entries(dispatchState.tasks || {})
-      .map(([id, task]) => ({ ...task, task_id: task.task_id || id }))
-      .filter(task => visible(dispatchBackend(task)));
-    const dispatchBySession = new Map();
-    for (const t of dispatchTasksList) {
-      const backend = dispatchBackend(t);
-      if (!dispatchBySession.has(backend)) dispatchBySession.set(backend, new Map());
-      if (t.session_id) dispatchBySession.get(backend).set(t.session_id, t);
-    }
-    const readCodexDb = (file, fn, fallback) => withReadOnlyDb(visible('codex') && file, fn, fallback);
+      .filter(([, task]) => task && typeof task === 'object' && (
+        task.backend ? ['codex', 'auto'].includes(task.backend) : !String(task.session_id || '').startsWith('sess_')
+      ))
+      .map(([id, task]) => ({ ...task, task_id: task.task_id || id }));
+    const dispatchBySession = new Map(dispatchTasksList.filter(t => t.session_id).map(t => [t.session_id, t]));
+    const includedIds = [...dispatchBySession.keys()];
+    if (threadId) includedIds.push(threadId);
 
     // 1. Read state_5.sqlite
-    const stateData = readCodexDb(
+    const stateData = withReadOnlyDb(
       this.stateDbPath,
       (db) => {
-        const projects = db.prepare('SELECT id, name FROM projects ORDER BY position ASC').all();
-        const roots = db.prepare(`
+        // The desktop client adds project metadata and spawn edges to the
+        // state database. CLI-only installations may have just the threads.
+        const tables = new Set(db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'").all().map(row => row.name));
+        const projects = tables.has('projects') ? db.prepare('SELECT id, name FROM projects').all() : [];
+        const roots = tables.has('project_roots') && tables.has('projects') ? db.prepare(`
           SELECT pr.project_id, pr.path, p.name AS project_name
           FROM project_roots pr
           JOIN projects p ON p.id = pr.project_id
-        `).all();
+        `).all() : [];
         const threads = db.prepare(`
-          SELECT id, rollout_path, created_at, updated_at, created_at_ms, updated_at_ms,
-                 source, thread_source, originator, cwd, title, name, preview,
-                 tokens_used, archived, is_pinned, git_branch, git_sha,
-                 model, reasoning_effort, agent_nickname, agent_role, agent_path,
-                 project_id, history_mode
-          FROM threads
+          SELECT * FROM threads
           WHERE id IN (SELECT id FROM threads ORDER BY updated_at DESC LIMIT ?)
              OR id IN (SELECT value FROM json_each(?))
           ORDER BY updated_at DESC
-        `).all(limit, JSON.stringify([...(dispatchBySession.get('codex')?.keys() || [])]));
+        `).all(limit, JSON.stringify(includedIds));
         const totalRow = db.prepare('SELECT COUNT(*) AS c FROM threads').get();
-        const spawnEdges = db.prepare(
+        const spawnEdges = tables.has('thread_spawn_edges') ? db.prepare(
           'SELECT parent_thread_id, child_thread_id, status FROM thread_spawn_edges'
-        ).all();
+        ).all() : [];
         return { projects, roots, threads, totalThreads: totalRow?.c || threads.length, spawnEdges };
       },
       { projects: [], roots: [], threads: [], totalThreads: 0, spawnEdges: [] }
@@ -673,7 +349,7 @@ export class CodexStore {
     }
 
     // 2. Read goals_1.sqlite
-    const goalsMap = readCodexDb(
+    const goalsMap = withReadOnlyDb(
       this.goalsDbPath,
       (db) => {
         const rows = db.prepare('SELECT * FROM thread_goals').all();
@@ -683,7 +359,7 @@ export class CodexStore {
     );
 
     // 3. Read queue_1.sqlite
-    const queueCountMap = readCodexDb(
+    const queueCountMap = withReadOnlyDb(
       this.queueDbPath,
       (db) => {
         const rows = db.prepare(
@@ -718,10 +394,10 @@ export class CodexStore {
     }
 
     // 6. Assemble Codex task cards
-    const codexTasks = stateData.threads.map((row) => {
+    const tasks = stateData.threads.map((row) => {
       const pref = prefsMap.get(row.id) || null;
       const goal = goalsMap.get(row.id) || null;
-      const dispatchTask = dispatchBySession.get('codex')?.get(row.id) || null;
+      const dispatchTask = dispatchBySession.get(row.id) || null;
       const latestTurn = latestTurnMap.get(row.id) || null;
       const subMeta = parseSubagentMeta(row);
       const spawnEdge = spawnByChild.get(row.id) || null;
@@ -763,8 +439,6 @@ export class CodexStore {
       return {
         id: row.id,
         shortId: row.id.slice(0, 8),
-        engine: 'codex',
-        engineLabel: engineMap.get('codex').name,
         title,
         customTitle: pref?.customTitle || null,
         rawTitle: (row.title || '').slice(0, 400),
@@ -773,7 +447,6 @@ export class CodexStore {
         cwd: row.cwd || '',
         branch: row.git_branch || dispatchTask?.branch || '',
         model: row.model || dispatchTask?.model || '',
-        rawModel: row.model || dispatchTask?.model || '',
         reasoningEffort: row.reasoning_effort || dispatchTask?.effort || '',
         source: row.source || '',
         originator: row.originator || '',
@@ -811,7 +484,6 @@ export class CodexStore {
         dispatchTask: dispatchTask
           ? {
               taskId: dispatchTask.task_id,
-              backend: dispatchTask.backend || 'codex',
               status: dispatchTask.status,
               difficulty: dispatchTask.difficulty,
               branch: dispatchTask.branch,
@@ -828,67 +500,51 @@ export class CodexStore {
       };
     });
 
-    const zcode = engineMap.get('zcode');
-    const providerLabels = visible('zcode') ? discoverZcodeEnvironment(zcode.binPath, zcode.configFilePath).providerLabels : {};
-    const zcodeTasks = visible('zcode') ? this._loadZcodeTasks({
-      limit: Math.max(60, Math.floor(limit / 2)), prefsMap, dispatchBySession: dispatchBySession.get('zcode') || new Map(),
-      opsByThread, bindingsByThread, engine: zcode, providerLabels,
-    }) : [];
-    const tasks = [...codexTasks, ...zcodeTasks];
-    const nativeIds = new Map(tasks.map(t => [t.id, t.engine]));
-    const dispatchCards = new Map();
+    // A newly dispatched task may not yet have a row in the Codex state database.
+    const byId = new Map(tasks.map(task => [task.id, task]));
     const results = new Map();
     for (const record of dispatchTasksList) {
-      const backend = dispatchBackend(record);
       const result = readDispatchRunResult(record.run_dir);
       results.set(record.task_id, result);
-      if (record.session_id && nativeIds.get(record.session_id) === backend) continue;
-      const id = !record.session_id || nativeIds.has(record.session_id) ? record.task_id : record.session_id;
+      const id = record.session_id || record.task_id;
+      if (byId.has(id)) continue;
       const cwd = record.workdir || record.worktree_path || record.original_cwd || record.repo_root || '';
       const pref = prefsMap.get(id);
       const summary = result?.report?.summary || result?.summary || record.report?.summary || record.summary || '';
-      const rawModel = record.model || result?.model_used || '';
+      const model = record.model || result?.model_used || '';
       const updatedAtMs = Date.parse(record.updated_at || record.created_at) || 0;
       const createdAtMs = Date.parse(record.created_at) || updatedAtMs;
       const title = cleanDisplayTitle({ customTitle: pref?.customTitle, dispatchTask: record, rawTitle: record.title || record.prompt, id });
-      const status = computeEffectiveStatus({ thread: { task_status: record.status }, dispatchTask: record });
+      const status = computeEffectiveStatus({ thread: {}, dispatchTask: record });
       const bindings = bindingsByThread.get(id) || [];
       const card = {
-        id, shortId: id.slice(0, 8), sessionId: record.session_id || null, engine: backend, engineLabel: engineMap.get(backend)?.name || backend,
+        id, shortId: id.slice(0, 8), sessionId: record.session_id || null,
         title, customTitle: pref?.customTitle || null, rawTitle: record.title || title,
         projectName: deriveProjectName({ cwd }, projectsById, projectRoots, record), cwd, branch: record.branch || '',
-        worktreeLabel: parseWorktreeLabel(record.worktree_path || cwd), model: backend === 'zcode' ? formatZcodeModelDisplay(rawModel, providerLabels) : rawModel,
-        rawModel, reasoningEffort: record.effort || '', source: 'dispatch', originator: backend,
+        worktreeLabel: parseWorktreeLabel(record.worktree_path || cwd), model,
+        reasoningEffort: record.effort || '', source: 'dispatch', originator: 'codex_exec',
         isExec: true, isManagedDispatch: true, isAgyDispatched: true, isSubagent: false, childCount: 0, parentThreadId: null,
         pinned: Boolean(pref?.pinned), hidden: Boolean(pref?.hidden), pinnedAt: pref?.pinnedAt || null, archived: false,
         tokensUsed: Number(result?.usage?.total_tokens || 0), durationSec: Math.max(0, Math.round((updatedAtMs - createdAtMs) / 1000)),
         createdAtMs, updatedAtMs, status, goal: null, queuedCount: 0, summary, latestReply: summary.slice(0, 220),
-        latestTurnStatus: record.status, dispatchTask: { taskId: record.task_id, backend, status: record.status, difficulty: record.difficulty,
+        latestTurnStatus: record.status, dispatchTask: { taskId: record.task_id, status: record.status, difficulty: record.difficulty,
           branch: record.branch, worktreePath: record.worktree_path, repoRoot: record.repo_root, isolation: record.isolation,
           sandbox: record.sandbox, exitCode: record.exit_code },
         bindingCount: bindings.length, changeKeys: bindings.map(b => b.changeKey),
         runningOpsCount: (opsByThread.get(id) || []).filter(op => op.status === 'running').length,
       };
-      dispatchCards.set(record.task_id, card);
-      nativeIds.set(id, backend);
+      byId.set(id, card);
       tasks.push(card);
     }
     tasks.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-    const byId = new Map(tasks.map(task => [task.id, task]));
     const managedAgents = dispatchTasksList
       .map((t) => {
-        const backend = dispatchBackend(t);
         const result = results.get(t.task_id);
-        const linkedThread = dispatchCards.get(t.task_id) || byId.get(t.session_id);
-        const rawMod = t.model || linkedThread?.rawModel || linkedThread?.model || '';
-        const displayMod = backend === 'zcode' ? formatZcodeModelDisplay(rawMod, providerLabels) : rawMod;
+        const linkedThread = byId.get(t.session_id || t.task_id);
         return {
           kind: 'dispatch',
           id: t.task_id,
           taskId: t.task_id,
-          backend,
-          engine: backend,
-          engineLabel: engineMap.get(backend)?.name || backend,
           threadId: linkedThread?.id || t.session_id || null,
           title:
             linkedThread?.title ||
@@ -896,9 +552,8 @@ export class CodexStore {
           projectName: t.repo_root
             ? path.basename(t.repo_root)
             : path.basename(t.original_cwd || ''),
-          status: linkedThread?.status?.code === 'running' ? 'running' : t.status || 'unknown',
-          model: displayMod,
-          rawModel: rawMod,
+          status: t.status || linkedThread?.status?.code || 'unknown',
+          model: t.model || linkedThread?.model || '',
           effort: t.effort || '',
           difficulty: t.difficulty || '',
           branch: t.branch || '',
@@ -924,18 +579,11 @@ export class CodexStore {
       .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
 
     const nonSubagentTasks = tasks.filter((t) => !t.isSubagent);
-    const engineCounts = Object.fromEntries(engineConfig.engines.map(e => [e.id, 0]));
-    for (const task of nonSubagentTasks) {
-      if (!task.hidden) engineCounts[task.engine] = (engineCounts[task.engine] || 0) + 1;
-    }
     const health = this.getHealth();
     const stats = {
-      totalThreads: stateData.totalThreads + zcodeTasks.length + dispatchCards.size,
+      totalThreads: stateData.totalThreads + tasks.length - stateData.threads.length,
       loadedThreads: tasks.length,
-      visibleThreads: nonSubagentTasks.length,
-      engineCounts,
-      codexCount: engineCounts.codex,
-      zcodeCount: engineCounts.zcode,
+      visibleThreads: nonSubagentTasks.filter(t => !t.hidden).length,
       agyCount: nonSubagentTasks.filter((t) => t.isAgyDispatched).length,
       execCount: tasks.filter((t) => t.isExec).length,
       runningCount: tasks.filter((t) => t.status.code === 'running').length,
@@ -952,7 +600,7 @@ export class CodexStore {
     const worktrees = [...new Set(tasks.map((t) => t.worktreeLabel).filter(Boolean))].sort();
 
     return {
-      connected: health.stateDbExists || health.zcodeCliDbExists || health.dispatchStateExists,
+      connected: health.stateDbExists,
       health,
       stats,
       filters: { projects, worktrees },
@@ -1014,118 +662,15 @@ export class CodexStore {
     return { latestTurnMap, durationMap, latestReplyMap };
   }
 
-  _getZcodeThreadDetail(sessionId, task) {
-    const history = withReadOnlyDb(
-      this.zcodeCliDbPath,
-      (db) => {
-        const rows = db
-          .prepare(
-            `SELECT p.id AS part_id, p.message_id, p.time_created, p.data AS part_json, p.sequence AS part_seq,
-                    m.data AS msg_json, m.sequence AS msg_seq
-             FROM part p
-             JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
-             WHERE p.session_id = ?
-             ORDER BY m.sequence ASC, p.sequence ASC
-             LIMIT 220`
-          )
-          .all(sessionId);
-
-        const messages = [];
-        let ord = 1;
-        for (const r of rows) {
-          try {
-            const mObj = JSON.parse(r.msg_json || '{}');
-            const pObj = JSON.parse(r.part_json || '{}');
-            if (
-              mObj.synthetic === true ||
-              mObj.visibility === 'model-only' ||
-              pObj.synthetic === true ||
-              pObj.visibility === 'model-only'
-            ) {
-              continue;
-            }
-            const role = mObj.role || 'assistant';
-            const pType = pObj.type || '';
-            if (pType === 'text' && typeof pObj.text === 'string' && pObj.text.trim()) {
-              const txt = pObj.text.trim();
-              messages.push({
-                id: r.part_id,
-                turnId: mObj.anchor?.turnId || r.message_id,
-                ordinal: ord++,
-                type: role === 'user' ? 'userMessage' : 'agentMessage',
-                createdAtMs: r.time_created,
-                text: txt.length > 4000 ? `${txt.slice(0, 4000)}\n…(已截断)` : txt,
-              });
-            } else if (pType === 'reasoning' && typeof pObj.text === 'string' && pObj.text.trim()) {
-              messages.push({
-                id: r.part_id,
-                turnId: r.message_id,
-                ordinal: ord++,
-                type: 'reasoning',
-                createdAtMs: r.time_created,
-                text: pObj.text.trim().slice(0, 1200),
-              });
-            } else if (pType === 'tool' || pObj.tool) {
-              const toolName = pObj.tool || pObj.name || 'Tool';
-              const stateStatus = pObj.state?.status || '';
-              const inputPreview = pObj.state?.input
-                ? JSON.stringify(pObj.state.input).slice(0, 260)
-                : '';
-              messages.push({
-                id: r.part_id,
-                turnId: r.message_id,
-                ordinal: ord++,
-                type: 'commandExecution',
-                createdAtMs: r.time_created,
-                text: `[${toolName}] ${inputPreview}${stateStatus ? ` (${stateStatus})` : ''}`,
-              });
-            }
-          } catch {
-            // skip malformed row
-          }
-        }
-        return { turns: [], messages };
-      },
-      { turns: [], messages: [] }
-    );
-
-    if (!history.messages.length && task?.latestReply) {
-      history.messages.push({
-        id: `${sessionId}-summary`,
-        turnId: 'turn-1',
-        ordinal: 1,
-        type: 'agentMessage',
-        createdAtMs: task.updatedAtMs,
-        text: task.latestReply,
-      });
-    }
-
-    const ops = this.consoleDb.listOps({ threadId: sessionId, limit: 25 });
-    const bindings = this.consoleDb.listBindings({ threadId: sessionId, limit: 20 });
-
-    return {
-      task,
-      turns: history.turns,
-      messages: history.messages,
-      queuedItems: [],
-      childThreads: [],
-      ops,
-      bindings,
-    };
-  }
-
   getThreadDetail(threadId) {
-    const snapshot = this.getSnapshot({ limit: 200 });
+    const snapshot = this.getSnapshot({ limit: 200, threadId });
     const task = snapshot.tasks.find(t => t.id === threadId || t.dispatchTask?.taskId === threadId) || null;
     if (!task) return { task: null, turns: [], messages: [], queuedItems: [], childThreads: [], ops: [], bindings: [] };
     threadId = task.id;
     if (task.source === 'dispatch') {
-      const record = readDispatchState().tasks?.[task.dispatchTask.taskId];
+      const record = readDispatchState(this.dispatchFile).tasks?.[task.dispatchTask.taskId];
       return { task, turns: [], messages: dispatchMessages(record, task), queuedItems: [], childThreads: [],
         ops: this.consoleDb.listOps({ threadId, limit: 25 }), bindings: this.consoleDb.listBindings({ threadId, limit: 20 }) };
-    }
-    if (task.engine === 'zcode') {
-      return this._getZcodeThreadDetail(threadId, task);
     }
 
     const history = withReadOnlyDb(
