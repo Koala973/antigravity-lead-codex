@@ -3,10 +3,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { DEFAULT_ZCODE_SCRIPT, codexCatalogOverride, engineConfigFile, expandPath, loadEngineConfig, resolveCodexBin, resolveNodeBin } from './engine-config.mjs';
+export { resolveCodexBin, resolveNodeBin } from './engine-config.mjs';
 
 const execFileAsync = promisify(execFile);
 
-const DISPATCH_SCRIPT = path.join(
+const DEFAULT_DISPATCH_SCRIPT = path.join(
   os.homedir(),
   '.gemini',
   'config',
@@ -16,10 +18,12 @@ const DISPATCH_SCRIPT = path.join(
   'dispatch.py'
 );
 
-const ZCODE_SCRIPT = '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs';
+function dispatchScript() {
+  return expandPath(process.env.AGY_DISPATCH_SCRIPT || DEFAULT_DISPATCH_SCRIPT);
+}
+
 const ZCODE_BUILTIN_CFG =
   '/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json';
-const ZCODE_PERSONAL_CFG = path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
 
 export const DIAGNOSE_BLOCKER_PROMPT =
   '请基于当前完整上下文和 Goal 目标，用 3~5 条要点精炼说明：' +
@@ -38,39 +42,6 @@ function isExecutable(p) {
   }
 }
 
-export function resolveCodexBin() {
-  const pathDirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
-  const candidates = [
-    process.env.CODEX_BIN,
-    ...pathDirs.map((dir) => path.join(dir, 'codex')),
-    path.join(os.homedir(), '.local', 'bin', 'codex'),
-    path.join(os.homedir(), '.npm-global', 'bin', 'codex'),
-    path.join(os.homedir(), '.volta', 'bin', 'codex'),
-    '/opt/homebrew/bin/codex',
-    '/usr/local/bin/codex',
-    '/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex',
-  ];
-  for (const c of candidates) {
-    if (isExecutable(c)) return c;
-  }
-  return 'codex';
-}
-
-export function resolveNodeBin() {
-  const pathDirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
-  const candidates = [
-    process.env.NODE_BIN,
-    ...pathDirs.map((dir) => path.join(dir, 'node')),
-    path.join(os.homedir(), '.local', 'bin', 'node'),
-    '/opt/homebrew/bin/node',
-    '/usr/local/bin/node',
-  ];
-  for (const c of candidates) {
-    if (isExecutable(c)) return c;
-  }
-  return 'node';
-}
-
 export function resolvePythonBin() {
   const candidates = [
     process.env.PYTHON_BIN,
@@ -85,7 +56,7 @@ export function resolvePythonBin() {
   return 'python3';
 }
 
-export function buildExecEnv() {
+export function buildExecEnv(engine) {
   const extraPaths = [
     path.join(os.homedir(), '.local', 'bin'),
     path.join(os.homedir(), '.npm-global', 'bin'),
@@ -102,10 +73,17 @@ export function buildExecEnv() {
   if (fs.existsSync(ZCODE_BUILTIN_CFG) && !env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE) {
     env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = ZCODE_BUILTIN_CFG;
   }
-  if (fs.existsSync(ZCODE_PERSONAL_CFG) && !env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE) {
-    env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = ZCODE_PERSONAL_CFG;
+  if (engine?.kind === 'zcode') env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = engineConfigFile(engine);
+  if (engine?.kind === 'codex') {
+    const catalog = codexCatalogOverride(engine.configFilePath);
+    if (catalog) env.AGY_MODELS_CACHE_FILE = catalog;
   }
   return env;
+}
+
+function codexCatalogArgs(engine) {
+  const file = codexCatalogOverride(engine.configFilePath);
+  return file && fs.existsSync(file) ? ['-c', 'model_catalog_json=' + JSON.stringify(file)] : [];
 }
 
 function safeCwd(cwd) {
@@ -147,99 +125,99 @@ function extractZcodeReply(stdoutText) {
 export class CodexRunner {
   constructor(consoleDb) {
     this.consoleDb = consoleDb;
-    this.codexBin = resolveCodexBin();
-    this.nodeBin = resolveNodeBin();
     this.pythonBin = resolvePythonBin();
   }
 
+  get codexBin() {
+    const codex = loadEngineConfig().engines.find(engine => engine.id === 'codex');
+    return expandPath(codex?.binPath) || resolveCodexBin() || 'codex';
+  }
+
   getRuntimeInfo() {
+    const { engines } = loadEngineConfig();
+    const codex = engines.find(e => e.id === 'codex');
+    const zcode = engines.find(e => e.id === 'zcode');
+    const zcodeScript = expandPath(zcode?.binPath || DEFAULT_ZCODE_SCRIPT);
+    const nodeBin = resolveNodeBin();
+    const script = dispatchScript();
     return {
-      codexBin: this.codexBin,
-      nodeBin: this.nodeBin,
-      zcodeAvailable: fs.existsSync(ZCODE_SCRIPT),
-      zcodeScript: ZCODE_SCRIPT,
-      dispatchAvailable: fs.existsSync(DISPATCH_SCRIPT),
-      dispatchScript: DISPATCH_SCRIPT,
+      codexBin: expandPath(codex?.binPath) || resolveCodexBin(), codexConfigFile: engineConfigFile(codex),
+      nodeBin, zcodeAvailable: Boolean(nodeBin && fs.existsSync(zcodeScript)), zcodeScript,
+      zcodeConfigFile: engineConfigFile(zcode), dispatchAvailable: fs.existsSync(script), dispatchScript: script,
     };
   }
 
+  sessionEngine(id, threadId) {
+    const key = id || (String(threadId).startsWith('sess_') ? 'zcode' : 'codex');
+    const engine = loadEngineConfig().engines.find(e => e.id === key);
+    if (!engine?.enabled) {
+      throw new Error(`引擎未启用或已移除: ${key}`);
+    }
+    return engine;
+  }
+
+  startCliResume({ engine, threadId, taskId, prompt, cwd, readonly, opType, dedupKey }) {
+    const script = dispatchScript();
+    const useDispatch = fs.existsSync(script) && (engine.kind !== 'zcode' || !readonly);
+    if (engine.kind !== 'zcode' && !useDispatch) throw new Error(`未找到多端调度脚本: ${script}`);
+    const dir = safeCwd(cwd);
+    let bin, args;
+    if (useDispatch) {
+      bin = this.pythonBin;
+      args = [script, 'resume', '--backend', engine.id,
+        ...(taskId && (!readonly || threadId === taskId) ? ['--task-id', taskId] : ['--session-id', threadId, '--cwd', dir]),
+        ...(readonly ? ['--sandbox', 'read-only', '--no-network'] : []), '--prompt', prompt];
+    } else {
+      bin = resolveNodeBin() || 'node';
+      args = [expandPath(engine.binPath) || this.getRuntimeInfo().zcodeScript, '--resume', threadId, '-p', prompt,
+        '--cwd', dir, '--mode', readonly ? 'plan' : 'build', '--json', '--no-color'];
+    }
+    const mode = readonly ? (useDispatch ? 'dispatch_readonly' : 'zcode_plan_readonly')
+      : (useDispatch ? 'dispatch_resume' : 'zcode_resume');
+    const op = this.consoleDb.createOp({ threadId, opType, prompt, mode, dedupKey, meta: { taskId, cwd: dir, engine: engine.id } });
+    const child = spawn(bin, args, { cwd: dir, env: buildExecEnv(engine), stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '', spawnError = '';
+    child.stdout.on('data', chunk => { if (stdout.length < 200_000) stdout += chunk.toString('utf8'); });
+    child.stderr.on('data', chunk => { if (stderr.length < 80_000) stderr += chunk.toString('utf8'); });
+    const timer = readonly ? setTimeout(() => child.kill('SIGTERM'), 180_000) : null;
+    child.on('error', err => { spawnError = err.message; });
+    child.on('close', code => {
+      clearTimeout(timer);
+      let outputText = extractZcodeReply(stdout);
+      try { outputText = JSON.parse(stdout)?.report?.summary || outputText; } catch { /* plain text */ }
+      this.consoleDb.finishOp(op.id, {
+        status: code === 0 ? 'succeeded' : 'failed', outputText,
+        errorText: spawnError || stderr.trim() || (code !== 0 ? `${engine.name} 退出码 ${code}` : null),
+        metaPatch: { exitCode: code },
+      });
+    });
+    return op;
+  }
+
   /**
-   * Non-destructive read-only question / blocker diagnosis:
+   * Read-only question or blocker diagnosis through the session engine.
    * - Codex thread: `codex exec fork --ephemeral -c sandbox_mode="read-only"`
-   * - ZCode session (`sess_...`): `node zcode.cjs --resume <id> -p <prompt> --mode plan --json`
+   * - Registered custom CLIs: dispatch resume --sandbox read-only.
+   * - ZCode session: `node zcode.cjs --resume <id> -p <prompt> --mode plan --json`
    */
-  startReadonlyAsk({ threadId, prompt, cwd, opType = 'readonly_ask', engine = null }) {
+  startReadonlyAsk({ threadId, prompt, cwd, opType = 'readonly_ask', engine = null, taskId = null }) {
     if (!threadId || String(threadId).trim().startsWith('-')) {
       throw new Error('无效的会话 ID');
     }
     const actualPrompt = (prompt || '').trim() || DIAGNOSE_BLOCKER_PROMPT;
-    const isZcode = engine === 'zcode' || String(threadId || '').startsWith('sess_');
-    const op = this.consoleDb.createOp({
-      threadId,
-      opType,
-      prompt: actualPrompt,
-      mode: isZcode ? 'zcode_plan_readonly' : 'fork_readonly',
-      meta: { cwd: safeCwd(cwd), engine: isZcode ? 'zcode' : 'codex' },
-    });
-
-    if (isZcode) {
-      const args = [
-        ZCODE_SCRIPT,
-        '--resume',
-        threadId,
-        '-p',
-        actualPrompt,
-        '--cwd',
-        safeCwd(cwd),
-        '--mode',
-        'plan',
-        '--json',
-        '--no-color',
-      ];
-      const child = spawn(this.nodeBin, args, {
-        cwd: safeCwd(cwd),
-        env: buildExecEnv(),
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.on('data', (chunk) => {
-        if (stdout.length < 200_000) stdout += chunk.toString('utf8');
-      });
-      child.stderr.on('data', (chunk) => {
-        if (stderr.length < 80_000) stderr += chunk.toString('utf8');
-      });
-      const timer = setTimeout(() => {
-        try {
-          child.kill('SIGTERM');
-        } catch {}
-      }, 180_000);
-      child.on('error', (err) => {
-        clearTimeout(timer);
-        this.consoleDb.finishOp(op.id, {
-          status: 'failed',
-          errorText: `启动 ZCode 只读诊断失败: ${err.message}`,
-        });
-      });
-      child.on('close', (code) => {
-        clearTimeout(timer);
-        const outputText = extractZcodeReply(stdout);
-        this.consoleDb.finishOp(op.id, {
-          status: code === 0 ? 'succeeded' : 'failed',
-          outputText: outputText || '',
-          errorText:
-            stderr.trim() ||
-            (code !== 0 ? `ZCode 只读提问退出码 ${code}` : outputText ? null : '未返回正文内容'),
-          metaPatch: { exitCode: code },
-        });
-      });
-      return op;
+    const entry = this.sessionEngine(engine, threadId);
+    if (entry.kind !== 'codex') {
+      return this.startCliResume({ engine: entry, threadId, taskId, prompt: actualPrompt, cwd, readonly: true, opType });
     }
+    const op = this.consoleDb.createOp({
+      threadId, opType, prompt: actualPrompt, mode: 'fork_readonly', meta: { cwd: safeCwd(cwd), engine: entry.id },
+    });
 
     const outFile = path.join(os.tmpdir(), `codex-console-${op.id}.txt`);
     const args = [
       'exec',
       'fork',
+      ...codexCatalogArgs(entry),
       '--ephemeral',
       '--skip-git-repo-check',
       '-c',
@@ -254,7 +232,7 @@ export class CodexRunner {
 
     const child = spawn(this.codexBin, args, {
       cwd: safeCwd(cwd),
-      env: buildExecEnv(),
+      env: buildExecEnv(entry),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -318,7 +296,7 @@ export class CodexRunner {
   }
 
   /**
-   * Send a message to an existing Codex or ZCode session:
+   * Send a message to an existing engine session:
    * - ZCode (`sess_...`): routes via `dispatch.py resume --backend zcode` or `zcode.cjs --resume`
    * - Codex (`mode='queue'`): `codex queue --thread <id> --message <msg> --resume`
    * - Codex (`mode='resume'`): `codex exec resume <id> <msg>`
@@ -337,7 +315,7 @@ export class CodexRunner {
     if (!cleanMsg) {
       throw new Error('消息内容不能为空');
     }
-    const isZcode = engine === 'zcode' || String(threadId || '').startsWith('sess_');
+    const entry = this.sessionEngine(engine, threadId);
 
     if (mode === 'readonly') {
       return this.startReadonlyAsk({
@@ -345,7 +323,7 @@ export class CodexRunner {
         prompt: cleanMsg,
         cwd,
         opType: 'readonly_ask',
-        engine: isZcode ? 'zcode' : 'codex',
+        engine: entry.id, taskId,
       });
     }
 
@@ -359,70 +337,9 @@ export class CodexRunner {
       }
     }
 
-    if (isZcode) {
-      const op = this.consoleDb.createOp({
-        threadId,
-        opType: taskId ? 'dispatch_resume' : 'exec_resume',
-        prompt: cleanMsg,
-        mode: taskId ? 'dispatch_resume' : 'zcode_resume',
-        dedupKey,
-        meta: { taskId, cwd: safeCwd(cwd), engine: 'zcode' },
-      });
-
-      const args = fs.existsSync(DISPATCH_SCRIPT)
-        ? [
-            DISPATCH_SCRIPT,
-            'resume',
-            '--backend',
-            'zcode',
-            ...(taskId ? ['--task-id', taskId] : ['--session-id', threadId, '--cwd', safeCwd(cwd)]),
-            '--prompt',
-            cleanMsg,
-          ]
-        : [
-            ZCODE_SCRIPT,
-            '--resume',
-            threadId,
-            '-p',
-            cleanMsg,
-            '--cwd',
-            safeCwd(cwd),
-            '--mode',
-            'build',
-            '--json',
-            '--no-color',
-          ];
-      const bin = fs.existsSync(DISPATCH_SCRIPT) ? this.pythonBin : this.nodeBin;
-      const child = spawn(bin, args, {
-        cwd: safeCwd(cwd),
-        env: buildExecEnv(),
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      let stdout = '';
-      let stderr = '';
-      child.stdout.on('data', (c) => {
-        if (stdout.length < 200_000) stdout += c.toString('utf8');
-      });
-      child.stderr.on('data', (c) => {
-        if (stderr.length < 80_000) stderr += c.toString('utf8');
-      });
-      child.on('close', (code) => {
-        let outText = stdout.trim();
-        try {
-          const parsed = JSON.parse(outText);
-          if (parsed?.report?.summary) outText = parsed.report.summary;
-        } catch {
-          outText = extractZcodeReply(outText);
-        }
-        this.consoleDb.finishOp(op.id, {
-          status: code === 0 ? 'succeeded' : 'failed',
-          outputText: outText,
-          errorText: stderr.trim() || (code !== 0 ? `ZCode 续跑退出码 ${code}` : null),
-          metaPatch: { exitCode: code },
-        });
-      });
-      return op;
+    if (entry.kind !== 'codex' || (mode === 'dispatch_resume' && taskId && fs.existsSync(dispatchScript()))) {
+      return this.startCliResume({ engine: entry, threadId, taskId, prompt: cleanMsg, cwd, readonly: false,
+        opType: taskId ? 'dispatch_resume' : 'exec_resume', dedupKey });
     }
 
     if (mode === 'queue') {
@@ -435,7 +352,7 @@ export class CodexRunner {
         meta: { cwd: safeCwd(cwd) },
       });
 
-      const args = ['queue', '--thread', threadId, '--message', cleanMsg, '--resume'];
+      const args = ['queue', ...codexCatalogArgs(entry), '--thread', threadId, '--message', cleanMsg, '--resume'];
       const validCwd = safeCwd(cwd);
       if (cwd && validCwd === cwd) {
         args.push('-C', validCwd);
@@ -444,7 +361,7 @@ export class CodexRunner {
       try {
         const { stdout, stderr } = await execFileAsync(this.codexBin, args, {
           cwd: validCwd,
-          env: buildExecEnv(),
+          env: buildExecEnv(entry),
           timeout: 30_000,
           maxBuffer: 1024 * 1024,
         });
@@ -464,45 +381,6 @@ export class CodexRunner {
       }
     }
 
-    if (mode === 'dispatch_resume' && taskId && fs.existsSync(DISPATCH_SCRIPT)) {
-      const op = this.consoleDb.createOp({
-        threadId,
-        opType: 'dispatch_resume',
-        prompt: cleanMsg,
-        mode: 'dispatch_resume',
-        dedupKey,
-        meta: { taskId, cwd: safeCwd(cwd) },
-      });
-
-      const child = spawn(
-        this.pythonBin,
-        [DISPATCH_SCRIPT, 'resume', '--task-id', taskId, '--prompt', cleanMsg],
-        {
-          cwd: safeCwd(cwd),
-          env: buildExecEnv(),
-          stdio: ['ignore', 'pipe', 'pipe'],
-        }
-      );
-
-      let stdout = '';
-      let stderr = '';
-      child.stdout.on('data', (c) => {
-        if (stdout.length < 200_000) stdout += c.toString('utf8');
-      });
-      child.stderr.on('data', (c) => {
-        if (stderr.length < 80_000) stderr += c.toString('utf8');
-      });
-      child.on('close', (code) => {
-        this.consoleDb.finishOp(op.id, {
-          status: code === 0 ? 'succeeded' : 'failed',
-          outputText: stdout.trim(),
-          errorText: stderr.trim() || (code !== 0 ? `dispatch resume 退出码 ${code}` : null),
-          metaPatch: { exitCode: code },
-        });
-      });
-      return op;
-    }
-
     // Default async exec resume
     const op = this.consoleDb.createOp({
       threadId,
@@ -516,10 +394,10 @@ export class CodexRunner {
     const outFile = path.join(os.tmpdir(), `codex-console-resume-${op.id}.txt`);
     const child = spawn(
       this.codexBin,
-      ['exec', 'resume', '--skip-git-repo-check', '-o', outFile, threadId, cleanMsg],
+      ['exec', 'resume', ...codexCatalogArgs(entry), '--skip-git-repo-check', '-o', outFile, threadId, cleanMsg],
       {
         cwd: safeCwd(cwd),
-        env: buildExecEnv(),
+        env: buildExecEnv(entry),
         stdio: ['ignore', 'pipe', 'pipe'],
       }
     );
@@ -560,32 +438,36 @@ export class CodexRunner {
   }
 
   /**
-   * Spawn a new managed Codex or ZCode worker via dispatch.py run
+   * Spawn a managed worker via dispatch.py run.
    */
   spawnWorker({
     cwd,
     prompt,
-    backend = 'codex',
+    backend = 'auto',
     model = '',
     taskId = '',
     difficulty = 'auto',
     quality = 'smart',
-    isolation = 'worktree',
+    isolation = loadEngineConfig().policy.defaultIsolation,
     network = false,
     changeKey = '',
     goalTitle = '',
   }) {
     const cleanCwd = (cwd || '').trim();
     const cleanPrompt = (prompt || '').trim();
-    const cleanBackend = backend === 'zcode' ? 'zcode' : 'codex';
+    const cleanBackend = (backend || 'auto').trim() || 'auto';
+    if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(cleanBackend) || cleanBackend === 'all') {
+      throw new Error(`无效的 CLI 引擎 ID: ${cleanBackend}`);
+    }
+    const script = dispatchScript();
     if (!cleanCwd || !fs.existsSync(cleanCwd)) {
       throw new Error(`目标工作目录不存在: ${cleanCwd || '(空)'}`);
     }
     if (!cleanPrompt) {
       throw new Error('任务指令（Prompt）不能为空');
     }
-    if (!fs.existsSync(DISPATCH_SCRIPT)) {
-      throw new Error(`未找到多端调度脚本: ${DISPATCH_SCRIPT}`);
+    if (!fs.existsSync(script)) {
+      throw new Error(`未找到多端调度脚本: ${script}`);
     }
 
     const useNetwork = Boolean(network);
@@ -605,7 +487,7 @@ export class CodexRunner {
     });
 
     const args = [
-      DISPATCH_SCRIPT,
+      script,
       'run',
       '--cwd',
       cleanCwd,
@@ -660,6 +542,7 @@ export class CodexRunner {
         parsed = null;
       }
       const sessionId = parsed?.session_id || null;
+      const actualBackend = parsed?.backend || cleanBackend;
       const finalTaskId = parsed?.task_id || taskId || null;
 
       if (changeKey && changeKey.trim()) {
@@ -669,7 +552,7 @@ export class CodexRunner {
             goalTitle: (goalTitle || '').trim() || cleanPrompt.slice(0, 80),
             threadId: sessionId,
             taskId: finalTaskId,
-            ownerRole: cleanBackend,
+            ownerRole: actualBackend,
             status: code === 0 ? 'completed' : 'blocked',
             repoPath: cleanCwd,
             branch: parsed?.branch || null,
@@ -688,7 +571,7 @@ export class CodexRunner {
         errorText: stderr.trim() || (code !== 0 ? `dispatch.py 退出码 ${code}` : null),
         metaPatch: {
           exitCode: code,
-          backend: cleanBackend,
+          backend: actualBackend,
           taskId: finalTaskId,
           sessionId,
           branch: parsed?.branch || null,

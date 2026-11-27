@@ -1,35 +1,220 @@
-# Antigravity Lead Codex + ZCode 协同黑板 (`docs/BLACKBOARD.md`)
+# Antigravity Lead Codex 协同黑板 (`docs/BLACKBOARD.md`)
 
-## 1. 目标与边界
+## 1. 重构目标：平权引擎池 + 工作流角色分配
 
-1. **三层智能体协同架构（不计成本、只看最高效果）**：
-   - **主控（Antigravity 哈基咪 · Gemini Ultra 5x）**：需求澄清（`/grill-me`）、架构拍板、前端视觉与交互打磨、50 行以内局部修改、浏览器/接口真实环境终审、分支合并与发布。
-   - **双主力执行手（Codex GPT 20x + ZCode 国模旗舰池）**：
-     - 核心后端架构、高难并发/状态机排障优先派 **Codex**（`gpt-6.2-astra` / `gpt-6.2-sol`）；
-     - 100 万超长上下文全库扫街、中文复杂业务、飞书/办公插件任务、批量模块开发派 **ZCode**（阿里云百炼 + 腾讯 TokenHub 双渠道自动点将 + 跨渠道三级自动热备）；
-   - **异构交叉初审 + 主控实测终审**：
-     - 谁写的代码绝不用同一个模型自审：Codex 写的任务由 ZCode（`deepseek-v4-pro-0813` / `kimi-k3` 最高推理 `max`）做后台交叉静态审查；ZCode 写的任务由 Codex（`gpt-6.2-astra`）做后台交叉静态审查；涉及钱、权限、登录、对外发消息的核心文件采用双引擎叠加最高推理深审；
-     - 后台审查通过后，由主控亲自核对差异并走完浏览器与真实接口终审。
+将原“Codex 必选写死 + ZCode 独占路由表”架构重构为：
+1. **通用平权引擎池（Unified Engine Registry）**：内置 `codex`、`zcode`、`claude`、`gemini`，支持用户新增/删除自定义 CLI 引擎；所有引擎共享同一套 Schema，系统仅要求**至少启用 1 个引擎**即可运行。
+2. **基于工作流的角色分配（Workflow-First Role Routing）**：
+   - **P0 主流程**：`primaryBuilder`（主力施工引擎）与 `reviewer`（代码审查引擎，支持 `auto_heterogeneous` 自动异构互审或 `explicit` 指定任意已启用引擎）。
+   - **P1 可选专项场景分流（4 项，默认关闭并跟随主力施工引擎）**：
+     - `wide_context`：超长上下文全库扫街（10+ 文件摸底）
+     - `architecture_concurrency`：核心架构重构与并发状态机排障
+     - `chinese_business_security`：中文复杂业务逻辑与安全测试分析
+     - `unit_tests_and_tools`：批量单元测试补齐与插件/脚本工具调用
 
-2. **调度器升级（`skills/multi-agent-dispatch/scripts/dispatch.py`）**：
-   - 激活 `--backend zcode` 为一等公民，支持 `run`、`batch`、`resume`、`review`（新增 `--backend auto` 在 `review` 时自动按原任务引擎切换异构引擎做交叉审查）。
-   - 基于实测跑分实现 ZCode 双渠道（`qwen-alibaba-model-studio-cn` 阿里云百炼 + `e2a41300-b652-45ec-9f78-ebd2ec7889be` 腾讯 TokenHub）按难度/场景自动选模与失败热备切换：
-     - `prefer_wide` / `>=10 files`：`腾讯TokenHub/glm-5.3 (max)` → `阿里云百炼/kimi-k3 (max)` → `阿里云百炼/deepseek-v4-pro-0813 (max)`
-     - `hard` / `review` / 代码实现与排障：`阿里云百炼/kimi-k3 (max)` → `阿里云百炼/deepseek-v4-pro-0813 (max)` → `腾讯TokenHub/deepseek-v4-pro-0813 (max)` → `腾讯TokenHub/kimi-k3 (max)`
-     - `medium` / `extreme` / 业务与方案推演：`阿里云百炼/kimi-k3 (max)` → `腾讯TokenHub/kimi-k3 (max)` → `阿里云百炼/qwen3.8-max (xhigh)`
-     - `low` / 工具与轻量任务：`阿里云百炼/qwen3.8-max (xhigh)` → `腾讯TokenHub/deepseek-v4.1-flash (max)` → `阿里云百炼/kimi-k3 (max)`
-   - 每次运行在 `run_dir/provider_config.json` 生成独立临时配置注入 `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`，并发安全且不污染全局配置。
-   - **ZCode 桌面端双向同步**：ZCode CLI 任务完成后自动将会话索引同步写入 `~/.zcode/v2/tasks-index.sqlite`（`tasks`、`task_group_admissions`、`task_group_view_node_orders`）与项目归属，使反重力派发的 ZCode 任务直接显示在 ZCode 桌面端左侧任务列表中。
+## 2. 本次协同分工
 
-3. **右侧栏可视化控制台升级（`plugins/codex-console`）**：
-   - 显示名称统一更名为 **`Antigravity Lead Codex`**（顶部简写徽章 `Antig Lead Codex`）。
-   - **双引擎全量聚合**：`CodexStore` 同时只读聚合 Codex（`~/.codex/*.sqlite`）与 ZCode（`~/.zcode/cli/db/db.sqlite` + `~/.zcode/v2/tasks-index.sqlite`）以及 `multi-agent-dispatch/state.json`。
-   - 任务卡片与详情展示引擎徽章（`Codex` / `ZCode`）与具体模型名，支持顶部引擎筛选（`全部` / `Codex` / `ZCode`）；默认置顶反重力派发任务，同时在「桌面端历史」折叠区展示 Codex 与 ZCode 桌面端原有任务。
-   - 支持对 ZCode 会话查看完整对话流、发起只读诊断/只读提问（`--resume <id> --mode plan`）、同步续跑（`--resume <id> --mode build`）以及新建受管子代理时直接选择引擎（`Codex` 或 `ZCode`）。
+- **主控（Antigravity Gemini）**：定稿 Schema 与接口契约、重构前端 `plugins/codex-console/ui/{main.js,styles.css}`、构建 `dist/app.html`、浏览器深浅色/宽窄屏实测终审、同步全局配置并发布推送。
+- **后端施工（Codex CLI · 隔离 Worktree）**：升级 `plugins/codex-console/server/{engine-config.mjs,codex-store.mjs,runner.mjs,index.mjs}`、`skills/multi-agent-dispatch/scripts/dispatch.py` 及对应测试 `tests/test_dispatch.py`、`tests/test-mcp-console.mjs`。
+- **异构交叉审计（ZCode CLI · `max` 推理）**：对 Codex 工作树改动及整体交付执行只读代码审查，拦截严重缺陷。
 
-## 2. 验收清单
+## 3. `engine_config.json` v2 数据契约
 
-- [x] 完成本机双渠道 9 模型实测跑分与数据库结构核实
-- [x] `dispatch.py` 支持 ZCode 智能选模、三级跨渠道热备、`resume`、`review`（含 `--backend auto` 异构交叉审查）与 ZCode 桌面端 `tasks-index.sqlite` 同步
-- [x] `plugins/codex-console` 完成 `Antigravity Lead Codex` 更名与 Codex + ZCode 双引擎任务/详情/只读诊断/续跑/新建子代理聚合
-- [x] 更新协同规则 `AGENTS.md` 与 `SKILL.md`，执行异构交叉代码审查并跑通全部自动化测试与 `doctor.sh`
+路径：`~/.local/state/multi-agent-dispatch/engine_config.json`（环境变量 `AGY_ENGINE_CONFIG_FILE` 可覆盖）。
+
+```json
+{
+  "version": 2,
+  "updatedAtMs": 1732671000000,
+  "engines": [
+    {
+      "id": "codex",
+      "name": "OpenAI Codex",
+      "builtin": true,
+      "kind": "codex",
+      "enabled": true,
+      "binPath": "",
+      "configFilePath": "~/.codex/models_cache.json",
+      "models": {
+        "primaryModel": "auto",
+        "fallbackModel": "",
+        "defaultEffort": "xhigh"
+      },
+      "adapter": {
+        "execTemplate": "codex exec -C {cwd} -m {model} -c model_reasoning_effort=\"{effort}\" -s {sandbox} --json -",
+        "readonlyTemplate": "codex exec review -m {model} -c model_reasoning_effort=\"{effort}\" -c sandbox_mode=\"read-only\" --json",
+        "resumeTemplate": "codex exec resume -m {model} -c model_reasoning_effort=\"{effort}\" {session_id} -",
+        "syncDesktopIndex": false
+      }
+    },
+    {
+      "id": "zcode",
+      "name": "ZCode CLI",
+      "builtin": true,
+      "kind": "zcode",
+      "enabled": true,
+      "binPath": "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+      "configFilePath": "~/.zcode/v2/provider_config.json",
+      "models": {
+        "primaryModel": "qwen-alibaba-model-studio-cn/kimi-k3",
+        "fallbackModel": "qwen-alibaba-model-studio-cn/deepseek-v4-pro-0813",
+        "defaultEffort": "max"
+      },
+      "adapter": {
+        "execTemplate": "node {bin} -p {prompt} --cwd {cwd} --mode build --json --no-color",
+        "readonlyTemplate": "node {bin} -p {prompt} --cwd {cwd} --mode plan --json --no-color",
+        "resumeTemplate": "node {bin} --resume {session_id} -p {prompt} --cwd {cwd} --mode build --json --no-color",
+        "syncDesktopIndex": true
+      }
+    },
+    {
+      "id": "claude",
+      "name": "Claude Code",
+      "builtin": true,
+      "kind": "custom_cli",
+      "enabled": false,
+      "binPath": "claude",
+      "configFilePath": "~/.claude.json",
+      "models": {
+        "primaryModel": "claude-sonnet-4-6",
+        "fallbackModel": "",
+        "defaultEffort": "high"
+      },
+      "adapter": {
+        "execTemplate": "{bin} -p {prompt} --model {model} --output-format json",
+        "readonlyTemplate": "{bin} -p {prompt} --model {model} --permission-mode plan --output-format json",
+        "resumeTemplate": "{bin} --resume {session_id} -p {prompt} --model {model} --output-format json",
+        "syncDesktopIndex": false
+      }
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini CLI",
+      "builtin": true,
+      "kind": "custom_cli",
+      "enabled": false,
+      "binPath": "gemini",
+      "configFilePath": "~/.gemini/settings.json",
+      "models": {
+        "primaryModel": "gemini-2.5-pro",
+        "fallbackModel": "",
+        "defaultEffort": "high"
+      },
+      "adapter": {
+        "execTemplate": "{bin} -p {prompt} -m {model} --output-format json",
+        "readonlyTemplate": "{bin} -p {prompt} -m {model} --output-format json",
+        "resumeTemplate": "{bin} --resume {session_id} -p {prompt} -m {model} --output-format json",
+        "syncDesktopIndex": false
+      }
+    }
+  ],
+  "workflowRoles": {
+    "primaryBuilder": {
+      "engineId": "codex",
+      "model": "auto",
+      "effort": "xhigh"
+    },
+    "reviewer": {
+      "mode": "auto_heterogeneous",
+      "engineId": "",
+      "model": "auto",
+      "effort": "max"
+    },
+    "scenarios": {
+      "wide_context": {
+        "enabled": false,
+        "engineId": "",
+        "model": "",
+        "fallbackModel": "",
+        "effort": "max"
+      },
+      "architecture_concurrency": {
+        "enabled": false,
+        "engineId": "",
+        "model": "",
+        "fallbackModel": "",
+        "effort": "xhigh"
+      },
+      "chinese_business_security": {
+        "enabled": false,
+        "engineId": "",
+        "model": "",
+        "fallbackModel": "",
+        "effort": "max"
+      },
+      "unit_tests_and_tools": {
+        "enabled": false,
+        "engineId": "",
+        "model": "",
+        "fallbackModel": "",
+        "effort": "max"
+      }
+    }
+  },
+  "policy": {
+    "costStrategy": "effect_first",
+    "defaultIsolation": "worktree",
+    "hideDisabledEngineTasks": false
+  }
+}
+```
+
+### 3.1 校验与兼容规则
+- **至少启用 1 个引擎**：保存配置时若 `engines.filter(e => e.enabled).length === 0`，直接拒绝并抛出清晰错误。
+- **角色自动兜底**：若 `primaryBuilder.engineId` 指向已停用或不存在的引擎，自动切换至第一个已启用引擎；若 `reviewer.mode === 'explicit'` 但目标引擎已停用，自动回退为 `auto_heterogeneous`。
+- **v1 自动迁移**：读取到旧版 v1 `engine_config.json`（含顶层 `codex` / `zcode` / `customAgents`）时，在 `loadEngineConfig()` 与 `dispatch.py` 中自动无损迁移为 v2 结构，并在保存时输出规范 v2。
+- **自定义引擎 ID 约束**：仅允许小写字母、数字、连字符和下划线（`/^[a-z0-9][a-z0-9_-]{0,31}$/`），不可重复，不可为 `auto` 或 `all`。
+
+### 3.2 `getEngineDiscoverySnapshot()` 返回结构
+```json
+{
+  "configPath": ".../engine_config.json",
+  "config": { "...v2 config..." },
+  "discovery": {
+    "engines": {
+      "<engineId>": {
+        "id": "<engineId>",
+        "available": true,
+        "detectedBin": "/path/to/bin",
+        "configExists": true,
+        "resolvedConfigPath": "/path/to/config.json",
+        "providers": [
+          { "providerId": "...", "providerName": "...", "models": ["..."] }
+        ],
+        "models": [
+          { "id": "...", "label": "...", "providerId": "", "providerName": "", "description": "", "contextWindow": 0 }
+        ]
+      }
+    }
+  }
+}
+```
+
+### 3.3 `dispatch.py` 调度与审查契约
+- `run`：`--backend` 默认 `auto`，接受 `auto` 或配置中的任意已启用引擎 ID（不再限于 `codex|zcode`）。
+  - `backend=auto` 时：先匹配 `workflowRoles.scenarios` 中已启用的对应专项场景（命中则路由至该场景引擎与模型/热备），否则路由至 `workflowRoles.primaryBuilder`。
+  - 显式传入 `--backend <id>` 时：查找引擎池中对应引擎并按其 `kind` 执行（`codex` / `zcode` 走内置深度适配；`custom_cli` 通过 `shlex.split` 解析 `adapter.*Template` 逐 token 替换占位符安全执行，严禁 `shell=True`）。
+- `review`：`--backend` 默认 `auto`，接受 `auto` 或任意已启用引擎 ID。
+  - `backend=auto` 时严格按 `workflowRoles.reviewer`：
+    - `mode == "explicit"` 且目标引擎已启用 -> 直接使用该引擎；
+    - `mode == "auto_heterogeneous"` -> 相对施工引擎（`task_record["backend"]` 或 `primaryBuilder.engineId`）选择另一个已启用的异构引擎（优先本机可用）；若只启用 1 个引擎则回退该引擎只读沙箱自审。
+- `resume`：支持 `codex`、`zcode` 以及 `custom_cli`（通过 `adapter.resumeTemplate`）。
+- `health`：`healthy` 判定为 `git` + `schema` 就绪且至少有 1 个已启用引擎本机可用；返回 `engines` 与 `workflow_roles` 摘要并保留 `codex` / `zcode` / `frontier_models` 字段。
+
+### 3.4 `codex-console` Server 与 UI 联动契约
+- `CodexStore.getSnapshot()`：
+  - 按 `policy.hideDisabledEngineTasks` 过滤所有被停用引擎（包括 `codex` 或 `zcode`）的任务；
+  - 将 `dispatch/state.json` 中来自任意自定义 CLI 引擎（如 `claude`/`gemini`/自定义）的任务也纳入统一 `tasks` 与 `managedAgents` 视图，使用引擎注册表中的展示名；
+  - `stats` 新增 `engineCounts: Record<string, number>` 并保留 `codexCount`、`zcodeCount`。
+- `CodexRunner.spawnWorker()`：默认 `backend = 'auto'`，透传任意有效引擎 ID 给 `dispatch.py run`；支持 `codex`/`zcode`/`custom_cli` 的续跑与只读提问。
+- `index.mjs` MCP 工具：
+  - `list_codex_tasks.engine`、`spawn_codex_worker.backend`、`manage_collab_binding.ownerRole` 均开放为字符串，不再写死 `codex|zcode` 枚举；
+  - `console_engine_settings` 接收 v2 配置（也兼容迁移 v1 patch），执行至少 1 个引擎启用的校验。
+
+## 4. 验收清单
+
+- [x] Codex 完成后端与 `dispatch.py` 平权重构并通过 `tests/test_dispatch.py` 与 `tests/test-mcp-console.mjs`
+- [x] ZCode 完成后端改动异构交叉代码审计，Codex 续跑修清全部 5 项 P1 并补齐回归测试
+- [x] 主控合入后端改动，完成前端设置页与 Spawn Modal 的 V1 流光平权重构并构建 `dist/app.html`
+- [x] Codex 完成前端改动快速只读交叉审查（62s），主控修清全部 3 项 P1，完成浏览器实测、`privacy-check.sh`、`install.sh --no-build`、`doctor.sh`
+- [x] 提交并推送至 GitHub `main` 分支

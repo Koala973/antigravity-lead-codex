@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Local multi-agent dispatcher for Antigravity -> Codex 100x & ZCode National Flagships.
-
-Dynamically discovers the newest official Codex frontier models from models_cache.json
-and ZCode dual-channel national flagship models (Alibaba Bailian + Tencent TokenHub),
-supports smart quality+difficulty routing with automatic cross-provider failover,
-manages isolated Git worktrees, syncs ZCode CLI sessions into ZCode Desktop's left
-sidebar (tasks-index.sqlite), supports heterogeneous cross-engine code review
-(--backend auto), and returns compact structured JSON summaries.
-"""
+"""Route local CLI workers and read-only reviews using the workflow and engine registry."""
 
 from __future__ import annotations
 
@@ -17,6 +9,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -44,6 +37,8 @@ ENGINE_CONFIG_FILE = Path(
     os.environ.get("AGY_ENGINE_CONFIG_FILE", str(STATE_DIR / "engine_config.json"))
 )
 
+_INITIAL_ENGINE_CONFIG_FILE = ENGINE_CONFIG_FILE
+
 ZCODE_HOME = Path(os.environ.get("ZCODE_HOME", os.path.expanduser("~/.zcode")))
 ZCODE_SCRIPT = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
 ZCODE_BUILTIN_PROVIDER_CONFIG = Path(
@@ -68,10 +63,12 @@ MODELS_CACHE_PATHS = (
 
 VALID_DIFFICULTIES = ("auto", "low", "medium", "hard", "extreme")
 VALID_QUALITIES = ("smart", "max", "balanced")
-VALID_BACKENDS = ("codex", "zcode")
-VALID_REVIEW_BACKENDS = ("auto", "codex", "zcode")
+VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+MODEL_ID = re.compile(r"[A-Za-z0-9._/:@-]{1,160}")
+VALID_BUILTIN_BACKENDS = ("codex", "zcode", "claude", "gemini")
 VALID_SANDBOXES = ("read-only", "workspace-write")
 VALID_ISOLATIONS = ("auto", "worktree", "inplace")
+MAX_FAILOVER_ATTEMPTS = 3
 
 EXTREME_KEYWORDS = (
     "architecture redesign",
@@ -288,7 +285,7 @@ def get_codex_bin() -> str | None:
 
 
 def get_node_bin() -> str | None:
-    return find_binary("node", ("~/.local/bin/node", "/opt/homebrew/bin/node"))
+    return find_binary(os.environ.get("NODE_BIN") or "node", ("~/.local/bin/node", "/opt/homebrew/bin/node"))
 
 
 def get_git_bin() -> str | None:
@@ -316,7 +313,7 @@ def normalize_cached_model(entry: dict[str, Any]) -> dict[str, Any] | None:
     slug = entry.get("slug") or entry.get("id")
     if not isinstance(slug, str) or not slug.strip():
         return None
-    if entry.get("visibility") != "list" or entry.get("supported_in_api") is False:
+    if entry.get("visibility") not in (None, "list") or entry.get("supported_in_api") is False:
         return None
     raw_levels = entry.get("supported_reasoning_levels")
     efforts: list[str] = []
@@ -373,14 +370,25 @@ def pick_frontier_roles(listed_models: list[dict[str, Any]]) -> tuple[dict[str, 
     return flagship, wide_fast
 
 
-def discover_frontier_models() -> dict[str, Any]:
-    """Read live Codex models cache and dynamically resolve flagship & wide_fast models."""
-    override = os.environ.get("AGY_MODELS_CACHE_FILE")
-    candidate_paths = (Path(os.path.expanduser(override)),) if override else MODELS_CACHE_PATHS
+def codex_catalog_override(config_file: str) -> str:
+    configured = config_file if config_file != "~/.codex/models_cache.json" else ""
+    return os.path.expanduser(os.environ.get("AGY_MODELS_CACHE_FILE") or configured)
 
+
+def codex_cache_paths(config_file: str = "") -> tuple[Path, ...]:
+    override = codex_catalog_override(config_file)
+    if override:
+        return (Path(override),)
+    if os.environ.get("CODEX_HOME"):
+        return tuple(Path(os.environ["CODEX_HOME"]).expanduser() / p.name for p in MODELS_CACHE_PATHS)
+    return MODELS_CACHE_PATHS
+
+
+def discover_frontier_models(config_file: str = "") -> dict[str, Any]:
+    """Read live Codex models cache and dynamically resolve flagship & wide_fast models."""
     best: dict[str, Any] | None = None
     best_score = (-1, (-2, 0, 0, 0, 0))
-    for cache_path in candidate_paths:
+    for cache_path in codex_cache_paths(config_file):
         if not cache_path.exists():
             continue
         try:
@@ -423,22 +431,208 @@ def discover_frontier_models() -> dict[str, Any]:
     return best
 
 
-def load_engine_config() -> dict[str, Any]:
-    """Load user-configured engine & routing settings saved by Antigravity Lead Codex Settings page."""
-    if not ENGINE_CONFIG_FILE.exists():
-        return {}
-    try:
-        raw = json.loads(ENGINE_CONFIG_FILE.read_text(encoding="utf-8"))
-        return raw if isinstance(raw, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+def engine_config_path() -> Path:
+    if ENGINE_CONFIG_FILE != _INITIAL_ENGINE_CONFIG_FILE:
+        return Path(ENGINE_CONFIG_FILE).expanduser()
+    state_dir = Path(os.environ.get("AGY_DISPATCH_STATE_DIR", STATE_DIR))
+    return Path(os.environ.get("AGY_ENGINE_CONFIG_FILE") or state_dir / "engine_config.json").expanduser()
 
 
-def discover_zcode_models() -> dict[str, Any]:
-    """Inspect local ~/.zcode/v2/provider_config.json for configured providers and models."""
-    cfg_path = Path(
-        os.environ.get("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", str(ZCODE_PERSONAL_PROVIDER_CONFIG))
+def custom_engine(engine_id: str) -> dict:
+    args = "-p {prompt} --model {model}"
+    return {
+        "id": engine_id, "name": engine_id, "builtin": False, "kind": "custom_cli",
+        "enabled": False, "binPath": engine_id, "configFilePath": "",
+        "models": {"primaryModel": "", "fallbackModel": "", "defaultEffort": "high"},
+        "adapter": {"execTemplate": "{bin} " + args, "readonlyTemplate": "{bin} " + args,
+                    "resumeTemplate": "{bin} --resume {session_id} " + args, "syncDesktopIndex": False},
+    }
+
+
+def default_engine_config() -> dict:
+    b = ZCODE_PROVIDER_BAILIAN
+    engines = [custom_engine(key) for key in VALID_BUILTIN_BACKENDS]
+    codex, zcode, claude, gemini = engines
+    for engine in engines:
+        engine["builtin"] = True
+    codex.update(name="OpenAI Codex", kind="codex", enabled=True, binPath="", configFilePath="~/.codex/models_cache.json")
+    codex["models"].update(primaryModel="auto", defaultEffort="xhigh")
+    codex["adapter"].update(
+        execTemplate='codex exec -C {cwd} -m {model} -c model_reasoning_effort="{effort}" -s {sandbox} --json -',
+        readonlyTemplate='codex exec review -m {model} -c model_reasoning_effort="{effort}" -c sandbox_mode="read-only" --json',
+        resumeTemplate='codex exec resume -m {model} -c model_reasoning_effort="{effort}" {session_id} -',
     )
+    zcode.update(name="ZCode CLI", kind="zcode", enabled=False, binPath=str(ZCODE_SCRIPT), configFilePath="~/.zcode/v2/provider_config.json")
+    zcode["models"].update(primaryModel=f"{b}/kimi-k3", fallbackModel=f"{b}/deepseek-v4-pro-0813", defaultEffort="max")
+    zargs = "-p {prompt} --cwd {cwd} --mode "
+    zcode["adapter"].update(execTemplate="node {bin} " + zargs + "build --json --no-color",
+                            readonlyTemplate="node {bin} " + zargs + "plan --json --no-color",
+                            resumeTemplate="node {bin} --resume {session_id} " + zargs + "build --json --no-color",
+                            syncDesktopIndex=True)
+    claude.update(name="Claude Code", configFilePath="~/.claude.json")
+    claude["models"]["primaryModel"] = "claude-sonnet-4-6"
+    gemini.update(name="Gemini CLI", configFilePath="~/.gemini/settings.json")
+    gemini["models"]["primaryModel"] = "gemini-2.5-pro"
+    for engine, flag in [(claude, "--model"), (gemini, "-m")]:
+        args = "-p {prompt} " + flag + " {model}"
+        plan = " --permission-mode plan" if engine is claude else ""
+        engine["adapter"].update(execTemplate="{bin} " + args + " --output-format json",
+                                 readonlyTemplate="{bin} " + args + plan + " --output-format json",
+                                 resumeTemplate="{bin} --resume {session_id} " + args + " --output-format json")
+    scenarios = {key: {"enabled": False, "engineId": "", "model": "", "fallbackModel": "",
+                       "effort": "xhigh" if key == "architecture_concurrency" else "max"}
+                 for key in ("wide_context", "architecture_concurrency", "chinese_business_security", "unit_tests_and_tools")}
+    return {
+        "version": 2, "updatedAtMs": 0, "engines": engines,
+        "workflowRoles": {"primaryBuilder": {"engineId": "codex", "model": "auto", "effort": "xhigh"},
+                          "reviewer": {"mode": "auto_heterogeneous", "engineId": "", "model": "auto", "effort": "max"},
+                          "scenarios": scenarios},
+        "policy": {"costStrategy": "effect_first", "defaultIsolation": "worktree", "hideDisabledEngineTasks": False},
+    }
+
+
+def update_fields(base: dict, patch: Any) -> None:
+    if not isinstance(patch, dict):
+        return
+    for key, value in base.items():
+        supplied = patch.get(key)
+        if isinstance(value, dict):
+            update_fields(value, supplied)
+        elif type(supplied) is type(value):
+            base[key] = supplied
+
+
+def legacy_zcode_scenarios(routes: dict, scenarios: dict) -> None:
+    # V1 seeded these selectors from installed providers. A fully saved, untouched
+    # settings form must not accidentally opt its owner into scenario routing.
+    models = [p["provider_id"] + "/" + m for p in discover_zcode_models()["providers"] for m in p["models"]]
+    b, t = ZCODE_PROVIDER_BAILIAN + "/", ZCODE_PROVIDER_TOKENHUB + "/"
+    bk, bd, bq = b + "kimi-k3", b + "deepseek-v4-pro-0813", b + "qwen3.8-max"
+    tk, td, tg, tf = t + "kimi-k3", t + "deepseek-v4-pro-0813", t + "glm-5.3", t + "deepseek-v4.1-flash"
+    for key, target, effort, pairs in [
+        ("wide_1m_context", "wide_context", "max", [(tg, bk), (bk, bd), (bd, tk)]),
+        ("reasoning_and_business", "chinese_business_security", "max", [(bk, tk), (tk, bq), (bq, bd)]),
+        ("fast_tool_and_plugin", "unit_tests_and_tools", "xhigh", [(bq, tf), (tf, bk), (bk, tk)]),
+    ]:
+        route = routes.get(key)
+        if not isinstance(route, dict):
+            continue
+        old = {"effort": effort}
+        benchmark = {"effort": effort}
+        for i, (slot, preferred) in enumerate(zip(("primary", "fallback1", "fallback2"), pairs)):
+            benchmark[slot] = preferred[0]
+            old[slot] = next((m for m in preferred if m in models),
+                             models[i] if len(models) > i else models[0] if models else preferred[0])
+        if all(any(route.get(k) and route[k] != v for k, v in defaults.items()) for defaults in (old, benchmark)):
+            backup = route.get("fallback1") or route.get("fallback2") or old["fallback1"]
+            if route.get("fallback2") and route["fallback2"] != old["fallback2"] and route.get("fallback1") == old["fallback1"]:
+                backup = route["fallback2"]
+            scenarios[target].update(enabled=True, engineId="zcode", model=route.get("primary") or old["primary"],
+                                     fallbackModel=backup,
+                                     effort=route.get("effort") or effort)
+
+
+def migrate_v1(saved: dict, config: dict) -> None:
+    codex, zcode = config["engines"][:2]
+    c, z = saved.get("codex") or {}, saved.get("zcode") or {}
+    update_fields(codex, {"enabled": c.get("enabled"), "binPath": c.get("binPath"),
+                          "models": {"primaryModel": c.get("flagshipModel"), "defaultEffort": c.get("defaultEffort"),
+                                     "fallbackModel": "" if c.get("fastModel") == "auto" else c.get("fastModel")}})
+    routes = z.get("routes") or {}
+    code = routes.get("code_and_audit") or {}
+    update_fields(zcode, {"enabled": z.get("enabled"), "binPath": z.get("scriptPath"),
+                          "models": {"primaryModel": code.get("primary") or None, "fallbackModel": code.get("fallback1") or None,
+                                     "defaultEffort": z.get("defaultEffort")},
+                          "adapter": {"syncDesktopIndex": z.get("syncDesktopIndex")}})
+    roles = config["workflowRoles"]
+    if routes:
+        legacy_zcode_scenarios(routes, roles["scenarios"])
+    update_fields(config["policy"], {"defaultIsolation": c.get("defaultIsolation")})
+    if (saved.get("policy") or {}).get("reviewPolicy") == "codex_only":
+        roles["reviewer"].update(mode="explicit", engineId="codex")
+    engines = {e["id"]: e for e in config["engines"]}
+    seen = {"codex", "zcode"}
+    for old in saved.get("customAgents") or []:
+        key = validate_engine_id(old["id"], seen)
+        engine = engines.get(key)
+        if engine is None:
+            engine = custom_engine(key)
+            config["engines"].append(engine)
+        name = old.get("name")
+        update_fields(engine, {"name": "Claude Code" if key == "claude" and name == "Claude Code CLI" else name,
+                               "binPath": old.get("binPath"), "enabled": old.get("enabled"),
+                               "configFilePath": old.get("configFilePath"),
+                               "models": {"primaryModel": old.get("defaultModel"), "defaultEffort": old.get("effort")}})
+        args = (old.get("argsTemplate") or "").strip()
+        if args:
+            engine["adapter"]["execTemplate"] = args if "{bin}" in args else "{bin} " + args
+
+
+def validate_engine_id(key: str, seen: set) -> str:
+    if not isinstance(key, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", key) or key in ("auto", "all"):
+        raise ValueError(f"Invalid CLI engine ID: {key}")
+    if key in seen:
+        raise ValueError(f"Duplicate CLI engine ID: {key}")
+    seen.add(key)
+    return key
+
+
+def load_engine_config() -> dict[str, Any]:
+    config = default_engine_config()
+    try:
+        saved = json.loads(engine_config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return config
+    if not isinstance(saved, dict):
+        return config
+    legacy = saved.get("version") != 2 or any(k in saved for k in ("codex", "zcode", "customAgents"))
+    if legacy:
+        migrate_v1(saved, config)
+    if "engines" in saved:
+        current = {e["id"]: e for e in config["engines"]}
+        engines = []
+        seen: set[str] = set()
+        for row in saved["engines"]:
+            key = validate_engine_id(row.get("id"), seen)
+            engine = current.get(key) or custom_engine(key)
+            update_fields(engine, {k: v for k, v in row.items() if k not in ("builtin", "kind")})
+            engines.append(engine)
+        for key, engine in current.items():
+            if engine["builtin"] and key not in seen:
+                if saved.get("version") == 2:
+                    engine["enabled"] = False
+                engines.append(engine)
+        config["engines"] = engines
+    update_fields(config["policy"], saved.get("policy"))
+    update_fields(config["workflowRoles"], saved.get("workflowRoles"))
+    update_fields(config, {"updatedAtMs": saved.get("updatedAtMs")})
+    active = [e["id"] for e in config["engines"] if e["enabled"]]
+    if not active:
+        recovered = config["engines"][0]
+        if saved.get("version") != 2 and (saved.get("codex") or {}).get("enabled") is False:
+            recovered = next(e for e in config["engines"] if e["id"] == "zcode")
+        recovered["enabled"] = True
+        active = [recovered["id"]]
+    roles = config["workflowRoles"]
+    missing_builder = saved.get("version") == 2 and not (saved.get("workflowRoles", {}).get("primaryBuilder") or {}).get("engineId")
+    if missing_builder or roles["primaryBuilder"]["engineId"] not in active:
+        roles["primaryBuilder"].update(engineId=active[0], model="auto")
+    reviewer = roles["reviewer"]
+    if reviewer["mode"] != "explicit" or reviewer["engineId"] not in active:
+        reviewer.update(mode="auto_heterogeneous", engineId="")
+    return config
+
+
+def zcode_config_path(config_file: str = "") -> Path:
+    if not config_file or config_file == "~/.zcode/v2/provider_config.json":
+        config_file = (Path(os.environ["ZCODE_HOME"]) / "v2" / "provider_config.json"
+                       if os.environ.get("ZCODE_HOME") else ZCODE_PERSONAL_PROVIDER_CONFIG)
+    return Path(os.environ.get("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE") or config_file).expanduser()
+
+
+def discover_zcode_models(config_file: str = "") -> dict[str, Any]:
+    """Inspect local ~/.zcode/v2/provider_config.json for configured providers and models."""
+    cfg_path = zcode_config_path(config_file)
     if not cfg_path.exists():
         return {"exists": False, "source_file": str(cfg_path), "providers": []}
     try:
@@ -446,19 +640,18 @@ def discover_zcode_models() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {"exists": False, "source_file": str(cfg_path), "providers": []}
 
-    rules = (
-        raw.get("config", {})
-        .get("providerConfigRules", {})
-        .get("providerRules", [])
-    )
+    root = raw.get("config") if isinstance(raw, dict) else None
+    rules_config = root.get("providerConfigRules") if isinstance(root, dict) else None
+    rules = rules_config.get("providerRules") if isinstance(rules_config, dict) else None
     providers: list[dict[str, Any]] = []
-    for r in rules:
+    for r in rules if isinstance(rules, list) else []:
         if not isinstance(r, dict):
             continue
         pid = str(r.get("providerId") or "").strip()
         pname = str(r.get("providerName") or ZCODE_PROVIDER_LABELS.get(pid, pid)).strip()
-        rcfg = r.get("config") or {}
-        models = list(rcfg.get("modelOrder") or rcfg.get("personalModelIds") or [])
+        rcfg = r.get("config") if isinstance(r.get("config"), dict) else {}
+        models = rcfg.get("modelOrder") or rcfg.get("personalModelIds") or []
+        models = models if isinstance(models, list) else []
         if pid:
             providers.append(
                 {
@@ -505,6 +698,92 @@ def classify_difficulty(prompt: str, files_hint: list[str] | None = None) -> tup
     return "medium", "default medium-tier implementation scope"
 
 
+def validate_model(value: str) -> str:
+    if not isinstance(value, str) or not MODEL_ID.fullmatch(value):
+        raise ValueError("Invalid model ID: expected 1–160 characters from A-Z, a-z, 0-9 or ._/:@-")
+    return value
+
+
+def validate_effort(value: str) -> str:
+    if value not in VALID_EFFORTS:
+        raise ValueError(f"Invalid reasoning effort: expected one of {', '.join(VALID_EFFORTS)}")
+    return value
+
+
+def selected_model(value: str | None) -> str | None:
+    return validate_model(value) if value not in (None, "", "auto") else None
+
+
+def match_scenario(prompt: str, files_hint: list[str] | None, difficulty: str, prefer_wide: bool) -> str | None:
+    text = prompt.lower()
+    if prefer_wide or len(files_hint or []) >= 10 or any(k in text for k in (
+        "wide context", "wide_context", "1m context", "whole repository", "repo-wide", "long context", "100万", "全库", "超长上下文", "长上下文",
+    )):
+        return "wide_context"
+    if any(k in text for k in ("architecture", "concurrency", "concurrent", "race condition", "deadlock", "distributed",
+                                "架构", "并发", "死锁", "分布式")):
+        return "architecture_concurrency"
+    if any(k in text for k in ("chinese_business_security", "business logic", "business rules", "security audit",
+                                "business security", "中文", "业务", "安全", "审批", "合规", "风控", "审计")):
+        return "chinese_business_security"
+    if any(k in text for k in ("unit test", "unit_test", "unittest", "pytest", "tooling", "tools", "plugin", "单测",
+                                "单元测试", "测试工具", "插件", "工具", "脚本")):
+        return "unit_tests_and_tools"
+    return None
+
+
+def registered_engine(config: dict, engine_id: str) -> dict:
+    engine = next((e for e in config["engines"] if e["id"] == engine_id), None)
+    if engine is None:
+        raise ValueError(f"Unknown CLI engine: {engine_id}")
+    if not engine["enabled"]:
+        raise ValueError(f"Engine '{engine_id}' is disabled in engine_config.json")
+    return engine
+
+
+def resolve_run_target(requested_backend, prompt, files_hint, difficulty, prefer_wide, explicit_model, explicit_effort, config):
+    if explicit_model is not None:
+        validate_model(explicit_model)
+    if explicit_effort is not None:
+        validate_effort(explicit_effort)
+    roles = config["workflowRoles"]
+    role = {}
+    scenario = None
+    backend = requested_backend
+    if backend in (None, "auto"):
+        active = [e["id"] for e in config["engines"] if e["enabled"]]
+        if not active:
+            raise ValueError("至少需要启用 1 个 CLI 引擎，无法全部关闭")
+        role = roles["primaryBuilder"]
+        backend = role["engineId"] if role["engineId"] in active else active[0]
+        key = match_scenario(prompt, files_hint, difficulty, prefer_wide)
+        candidate = roles["scenarios"].get(key, {})
+        if candidate.get("enabled") and candidate.get("engineId") in active:
+            scenario, role, backend = key, candidate, candidate["engineId"]
+    engine = registered_engine(config, backend)
+    effort = explicit_effort or role.get("effort")
+    if effort:
+        validate_effort(effort)
+    return {"backend": backend, "engine": engine, "scenario": scenario, "scenario_role": role if scenario else {},
+            "model": selected_model(explicit_model) or selected_model(role.get("model")),
+            "fallback_model": selected_model(role.get("fallbackModel")),
+            "effort": effort}
+
+
+def engine_bin(engine: dict) -> str | None:
+    configured = os.path.expanduser(engine["binPath"])
+    if engine["kind"] == "zcode":
+        script = Path(configured or ZCODE_SCRIPT)
+        return str(script) if script.is_file() else None
+    if engine["kind"] == "codex" and not configured:
+        return get_codex_bin()
+    return find_binary(configured or engine["id"])
+
+
+def is_engine_available(engine: dict) -> bool:
+    return bool(engine_bin(engine) and (engine["kind"] != "zcode" or get_node_bin()))
+
+
 def resolve_zcode_model_and_fallbacks(
     *,
     difficulty: str,
@@ -514,6 +793,8 @@ def resolve_zcode_model_and_fallbacks(
     explicit_effort: str | None = None,
     prefer_wide: bool = False,
     is_review: bool = False,
+    engine: dict | None = None,
+    scenario_override: dict | None = None,
 ) -> dict[str, Any]:
     """Select the optimal ZCode flagship model & multi-provider failover chain based on live benchmarks."""
     if difficulty == "auto":
@@ -528,7 +809,6 @@ def resolve_zcode_model_and_fallbacks(
 
     if use_wide:
         scenario = "wide_1m_context"
-        route_key = "wide_1m_context"
         base_chain = [
             (ZCODE_PROVIDER_TOKENHUB, "glm-5.3", "max", "腾讯TokenHub 100万窗口主选"),
             (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 一级热备"),
@@ -536,7 +816,6 @@ def resolve_zcode_model_and_fallbacks(
         ]
     elif is_code_heavy:
         scenario = "code_and_audit_flagship"
-        route_key = "code_and_audit"
         base_chain = [
             (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 多轮工具/代码审计主选(6.1s)"),
             (ZCODE_PROVIDER_BAILIAN, "deepseek-v4-pro-0813", "max", "阿里云百炼 深度代码一级热备(TTFT 2.2s)"),
@@ -545,7 +824,6 @@ def resolve_zcode_model_and_fallbacks(
         ]
     elif effective_difficulty in ("medium", "extreme"):
         scenario = "reasoning_and_business_flagship"
-        route_key = "reasoning_and_business"
         base_chain = [
             (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 综合/业务主选(6.1s)"),
             (ZCODE_PROVIDER_TOKENHUB, "kimi-k3", "max", "腾讯TokenHub 同模型一级热备"),
@@ -553,24 +831,28 @@ def resolve_zcode_model_and_fallbacks(
         ]
     else:
         scenario = "fast_tool_flagship"
-        route_key = "fast_tool_and_plugin"
         base_chain = [
             (ZCODE_PROVIDER_BAILIAN, "qwen3.8-max", "xhigh", "阿里云百炼 工具/轻量主选(7.8s)"),
             (ZCODE_PROVIDER_TOKENHUB, "deepseek-v4.1-flash", "max", "腾讯TokenHub 零报错一级热备"),
             (ZCODE_PROVIDER_BAILIAN, "kimi-k3", "max", "阿里云百炼 二级热备"),
         ]
 
-    engine_cfg = load_engine_config()
-    zcode_cfg = engine_cfg.get("zcode") if isinstance(engine_cfg.get("zcode"), dict) else {}
-    custom_routes = zcode_cfg.get("routes") if isinstance(zcode_cfg.get("routes"), dict) else {}
-    route_override = custom_routes.get(route_key) if isinstance(custom_routes.get(route_key), dict) else {}
-
-    discovered_z = discover_zcode_models()
+    if explicit_model is not None:
+        validate_model(explicit_model)
+    if engine is None:
+        engine = next(e for e in load_engine_config()["engines"] if e["id"] == "zcode")
+    settings = engine["models"]
+    scenario_override = scenario_override or {}
+    discovered_z = discover_zcode_models(engine["configFilePath"])
     dynamic_labels = dict(ZCODE_PROVIDER_LABELS)
     for p in discovered_z.get("providers", []):
         if isinstance(p, dict) and p.get("provider_id") and p.get("provider_name"):
             dynamic_labels[str(p["provider_id"])] = str(p["provider_name"])
 
+    configured_effort = settings["defaultEffort"] if engine_config_path().is_file() else None
+    preferred_effort = explicit_effort or scenario_override.get("effort") or configured_effort
+    if preferred_effort is not None:
+        validate_effort(preferred_effort)
     chain: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -587,7 +869,7 @@ def resolve_zcode_model_and_fallbacks(
                 "provider_label": dynamic_labels.get(pid, pid),
                 "model_id": mid,
                 "full_model": f"{pid}/{mid}",
-                "effort": explicit_effort or eff,
+                "effort": preferred_effort or eff,
                 "note": note,
             }
         )
@@ -609,18 +891,21 @@ def resolve_zcode_model_and_fallbacks(
                 if raw_m in ("kimi-k3", "deepseek-v4-pro-0813"):
                     _add_candidate(ZCODE_PROVIDER_TOKENHUB, raw_m, eff, "用户显式指定模型(腾讯TokenHub同模热备)")
 
-    # Apply user-configured scenario route from Settings page if present
-    if route_override:
-        cfg_eff = str(route_override.get("effort") or zcode_cfg.get("defaultEffort") or "max")
-        for slot_key, slot_label in (
-            ("primary", "设置页主选模型"),
-            ("fallback1", "设置页一级热备"),
-            ("fallback2", "设置页二级热备"),
-        ):
-            val = str(route_override.get(slot_key) or "").strip()
-            if "/" in val:
-                pid, mid = val.split("/", 1)
-                _add_candidate(pid.strip(), mid.strip(), cfg_eff, slot_label)
+    def add_setting(model, note):
+        if not selected_model(model):
+            return
+        pid, sep, mid = model.partition("/")
+        if not sep:
+            pid, mid = next((p["provider_id"] for p in discovered_z["providers"] if model in p["models"]),
+                            ZCODE_PROVIDER_BAILIAN), model
+        _add_candidate(pid, mid, scenario_override.get("effort") or settings["defaultEffort"], note)
+
+    add_setting(scenario_override.get("model"), "场景主选模型")
+    add_setting(scenario_override.get("fallbackModel"), "场景备用模型")
+    default_pair = (f"{ZCODE_PROVIDER_BAILIAN}/kimi-k3", f"{ZCODE_PROVIDER_BAILIAN}/deepseek-v4-pro-0813")
+    if (settings["primaryModel"], settings["fallbackModel"]) != default_pair:
+        add_setting(settings["primaryModel"], "设置页主选模型")
+        add_setting(settings["fallbackModel"], "设置页一级热备")
 
     for pid, mid, eff, note in base_chain:
         _add_candidate(pid, mid, eff, note)
@@ -664,6 +949,7 @@ def resolve_model_and_effort(
     quality: str = "smart",
     alternate: bool | None = None,
     prefer_wide: bool = False,
+    config_file: str = "",
 ) -> dict[str, Any]:
     """Dynamically route across newest official Codex models by quality mode & difficulty."""
     if difficulty == "auto":
@@ -673,7 +959,7 @@ def resolve_model_and_effort(
         difficulty_reason = f"explicit difficulty={difficulty}"
 
     use_alternate = (quality in ("smart", "balanced")) if alternate is None else alternate
-    frontier = discover_frontier_models()
+    frontier = discover_frontier_models(config_file)
     flagship = frontier["flagship"]
     wide_fast = frontier["wide_fast"]
     flagship_slug = flagship["slug"] if flagship else None
@@ -1137,58 +1423,55 @@ def parse_report_file(
     }
 
 
-def parse_zcode_output(stdout_text: str, stderr_text: str, exit_code: int) -> dict[str, Any]:
-    """Parse zcode --json output (either single JSON document or NDJSON lines)."""
-    session_id: str | None = None
-    assistant_texts: list[str] = []
-    usage: dict[str, Any] | None = None
-
-    stripped = stdout_text.strip()
-    parsed_objs: list[Any] = []
-    if stripped:
-        try:
-            parsed_objs.append(json.loads(stripped))
-        except json.JSONDecodeError:
-            for line in stripped.splitlines():
-                ln = line.strip()
-                if not ln:
-                    continue
-                try:
-                    parsed_objs.append(json.loads(ln))
-                except json.JSONDecodeError:
-                    continue
-
-    for obj in parsed_objs:
-        if session_id is None:
-            session_id = extract_session_id_from_obj(obj)
-        if isinstance(obj, dict):
-            if isinstance(obj.get("usage"), dict):
-                usage = obj["usage"]
-            for key in ("result", "response", "text", "content", "message", "output"):
-                val = obj.get(key)
-                if isinstance(val, str) and val.strip():
-                    assistant_texts.append(val.strip())
-                elif isinstance(val, dict) and isinstance(val.get("text"), str):
-                    assistant_texts.append(val["text"].strip())
-
-    raw_summary = assistant_texts[-1] if assistant_texts else stripped
-    if not raw_summary:
-        raw_summary = "\n".join(stderr_text.splitlines()[-20:])
-    summary = raw_summary[:2000] if raw_summary else f"ZCode exited with code {exit_code}."
-
-    return {
-        "session_id": session_id,
-        "usage": usage,
-        "report": {
-            "status": "completed" if exit_code == 0 else "failed",
-            "summary": summary,
-            "files_modified": [],
-            "commands_run": [],
-            "verification_passed": exit_code == 0,
-            "risks_or_followups": [],
-            "notes_for_orchestrator": "Raw ZCode output truncated to <=2000 chars; full stdout saved in run_dir.",
-        },
-    }
+def parse_generic_cli_output(stdout: str, stderr: str, exit_code: int) -> dict[str, Any]:
+    """Read structured reports, Claude/Gemini result envelopes, event streams or plain text."""
+    try:
+        events = json.loads(stdout)
+        events = events if isinstance(events, list) else [events]
+    except ValueError:
+        events = []
+        for line in stdout.splitlines():
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                events.append(line)
+    session_id = usage = None
+    report = {}
+    summary = ""
+    for event in events:
+        if isinstance(event, str):
+            if event.strip():
+                summary = "\n".join([summary, event]).strip()
+            continue
+        if not isinstance(event, dict):
+            continue
+        session_id = extract_session_id_from_obj(event) or session_id
+        usage = event.get("usage") or event.get("stats") or usage
+        result = event.get("report", event.get("result", event))
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except ValueError:
+                pass
+        if isinstance(result, dict) and isinstance(result.get("summary"), str):
+            report = result
+            summary = report["summary"]
+            continue
+        for key in ("report", "result", "response", "text", "content", "message", "output"):
+            value = event.get(key)
+            if isinstance(value, dict):
+                value = value.get("text") or value.get("content")
+            if isinstance(value, list):
+                value = "\n".join(v["text"] for v in value if isinstance(v, dict) and isinstance(v.get("text"), str))
+            if isinstance(value, str) and value.strip():
+                summary = value.strip()
+                break
+    summary = summary or stdout.strip() or stderr.strip() or f"CLI exited with code {exit_code}."
+    normalized = {"status": "completed", "files_modified": [], "commands_run": [], "verification_passed": False,
+                  "risks_or_followups": [], "notes_for_orchestrator": "", **report, "summary": summary if report else summary[:2000]}
+    if exit_code:
+        normalized.update(status="failed", verification_passed=False)
+    return {"session_id": session_id, "usage": usage, "report": normalized}
 
 
 def write_zcode_run_provider_config(
@@ -1196,18 +1479,16 @@ def write_zcode_run_provider_config(
     provider_id: str,
     model_id: str,
     effort: str | None = None,
-) -> Path | None:
+    config_file: str = "",
+) -> Path:
     """Create a per-run isolated provider_config.json that pins ZCode CLI to provider_id/model_id."""
-    base_path = Path(
-        os.environ.get("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", str(ZCODE_PERSONAL_PROVIDER_CONFIG))
-    )
-    if not base_path.exists():
-        return None
+    base_path = zcode_config_path(config_file)
     try:
         cfg = json.loads(base_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-
+    except FileNotFoundError:
+        cfg = {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read ZCode provider config: {base_path}") from exc
     c_root = cfg.setdefault("config", {})
     cur_order = list(c_root.get("providerOrder") or [])
     c_root["providerOrder"] = [provider_id] + [p for p in cur_order if p != provider_id]
@@ -1457,9 +1738,9 @@ def build_codex_exec_cmd(
         str(workdir),
     ]
     if model:
-        cmd.extend(["-m", model])
+        cmd.extend(["-m", validate_model(model)])
     if effort:
-        cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
+        cmd.extend(["-c", f'model_reasoning_effort="{validate_effort(effort)}"'])
     cmd.extend([
         "-s",
         sandbox,
@@ -1500,9 +1781,9 @@ def build_codex_resume_cmd(
         "resume",
     ]
     if model:
-        cmd.extend(["-m", model])
+        cmd.extend(["-m", validate_model(model)])
     if effort:
-        cmd.extend(["-c", f'model_reasoning_effort="{effort}"'])
+        cmd.extend(["-c", f'model_reasoning_effort="{validate_effort(effort)}"'])
     cmd.extend([
         "-c",
         f'sandbox_mode="{sandbox}"',
@@ -1549,96 +1830,168 @@ def run_subprocess_with_timeout(
         return 124, out, f"{err}\n[dispatcher] Timed out after {timeout}s".strip(), True
 
 
-def run_zcode_with_failover(
-    *,
-    node_bin: str,
-    prompt_text: str,
-    workdir: Path,
-    zmode: str,
-    routing: dict[str, Any],
-    run_dir: Path,
-    timeout: int,
-    resume_session_id: str | None = None,
-) -> dict[str, Any]:
-    """Execute ZCode CLI across the prioritized provider/model chain with automatic failover."""
-    chain = routing.get("fallback_chain") or [
-        {
-            "provider_id": routing.get("provider_id", ZCODE_PROVIDER_BAILIAN),
-            "provider_label": routing.get("provider_label", "阿里云百炼"),
-            "model_id": routing.get("model_id", "kimi-k3"),
-            "full_model": routing.get("model", f"{ZCODE_PROVIDER_BAILIAN}/kimi-k3"),
-            "effort": routing.get("effort", "max"),
-            "note": "default fallback",
-        }
-    ]
+def plan_routing(target, config, *, prompt, difficulty, quality, alternate=None, files_hint=None, prefer_wide=False, review=False):
+    engine = target["engine"]
+    settings = engine["models"]
+    model, effort = target["model"], target["effort"]
+    validate_effort(effort or settings["defaultEffort"])
+    fallback = target["fallback_model"] or selected_model(settings["fallbackModel"])
+    if engine["kind"] == "zcode":
+        routing = resolve_zcode_model_and_fallbacks(
+            difficulty=difficulty, prompt=prompt, files_hint=files_hint, explicit_model=model,
+            explicit_effort=effort, prefer_wide=prefer_wide, is_review=review, engine=engine,
+            scenario_override=target["scenario_role"],
+        )
+    elif engine["kind"] == "codex":
+        if quality == "smart":
+            quality = "max" if config["policy"]["costStrategy"] == "effect_first" else "balanced"
+        routing = resolve_model_and_effort(
+            difficulty=difficulty, prompt=prompt, files_hint=files_hint, explicit_model=model or selected_model(settings["primaryModel"]),
+            explicit_effort=effort or (settings["defaultEffort"] if quality != "balanced" else None),
+            quality=quality, alternate=alternate, prefer_wide=prefer_wide, config_file=engine["configFilePath"],
+        )
+    else:
+        effective = classify_difficulty(prompt, files_hint)[0] if difficulty == "auto" else difficulty
+        routing = {"model": model or selected_model(settings["primaryModel"]), "effort": effort or settings["defaultEffort"],
+                   "requested_difficulty": difficulty, "effective_difficulty": effective}
+    if engine["kind"] != "zcode":
+        routing["fallback_chain"] = [{"full_model": m, "effort": routing["effort"]}
+                                     for m in dict.fromkeys([routing["model"], *([fallback] if fallback else [])])]
+    routing["fallback_model"] = next((c["full_model"] for c in routing["fallback_chain"][1:]), None)
+    if target["scenario"]:
+        routing["workflow_scenario"] = target["scenario"]
+    return routing
 
-    attempts: list[dict[str, Any]] = []
-    last_rc = 1
-    last_stdout = ""
-    last_stderr = ""
-    last_timed_out = False
-    used_candidate = chain[0]
 
-    for idx, cand in enumerate(chain):
-        used_candidate = cand
-        cfg_override = write_zcode_run_provider_config(
-            run_dir,
-            cand["provider_id"],
-            cand["model_id"],
-            cand.get("effort"),
-        )
-        cmd = [node_bin, str(ZCODE_SCRIPT)]
-        if resume_session_id:
-            cmd.extend(["--resume", resume_session_id])
-        cmd.extend([
-            "-p",
-            prompt_text,
-            "--cwd",
-            str(workdir),
-            "--mode",
-            zmode,
-            "--json",
-            "--no-color",
-        ])
-        rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
-            cmd,
-            cwd=workdir,
-            stdin_text=None,
-            timeout=timeout,
-            env=build_zcode_env(cfg_override),
-        )
-        last_rc, last_stdout, last_stderr, last_timed_out = rc, stdout_text, stderr_text, timed_out
-        attempts.append(
-            {
-                "attempt": idx + 1,
-                "provider_id": cand["provider_id"],
-                "provider_label": cand["provider_label"],
-                "model_id": cand["model_id"],
-                "full_model": cand["full_model"],
-                "effort": cand.get("effort"),
-                "exit_code": rc,
-                "timed_out": timed_out,
-            }
-        )
+def build_generic_cli_cmd(template, *, bin_path, prompt, cwd, model, effort, sandbox, session_id):
+    tokens = shlex.split(template)
+    if not tokens:
+        raise ValueError("Missing CLI command template")
+    values = {"bin": bin_path, "prompt": prompt, "cwd": cwd, "model": selected_model(model),
+              "effort": validate_effort(effort) if effort else "", "sandbox": sandbox, "session_id": session_id}
+    optional = {"{model}": {"-m", "--model"}, "{session_id}": {"--resume"}}
+    result = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        i += 1
+        if i < len(tokens) and token in optional.get(tokens[i], set()) and not values[tokens[i][1:-1]]:
+            i += 1
+            continue
+        if (token == "{session_id}" and not session_id) or (token == "{model}" and not values["model"]):
+            continue
+        if token in ("--model={model}", "-m={model}") and not values["model"]:
+            continue
+        if token == "--resume={session_id}" and not session_id:
+            continue
+        # Substitute once on the template token. Braces in the prompt remain literal.
+        result.append(re.sub(r"\{(bin|prompt|cwd|model|effort|sandbox|session_id)\}",
+                             lambda m: str(values[m[1]] or ""), token))
+    return result
+
+
+def generic_template(engine, sandbox, session_id):
+    adapter = engine["adapter"]
+    if sandbox != "read-only":
+        return adapter["resumeTemplate"] if session_id else adapter["execTemplate"]
+    template = adapter["readonlyTemplate"]
+    if session_id and "{session_id}" not in template:
+        # Retain the session selector from the resume command and permissions from the read-only command.
+        resume = shlex.split(adapter["resumeTemplate"])
+        for i, token in enumerate(resume):
+            if "{session_id}" in token:
+                selector = [token]
+                if token == "{session_id}" and i and resume[i - 1].startswith("-"):
+                    selector.insert(0, resume[i - 1])
+                return template + " " + shlex.join(selector)
+        raise ValueError(f"No read-only resume selector configured for {engine['id']}")
+    return template
+
+
+def engine_command(engine, *, binary, workdir, prompt, model, effort, sandbox, network, output_path,
+                   is_git_repo, session_id=None, review_args=None):
+    if engine["kind"] == "codex":
+        if review_args is not None:
+            cmd = [binary, "exec", "review"]
+            if model:
+                cmd.extend(["-m", validate_model(model)])
+            if effort:
+                cmd.extend(["-c", f'model_reasoning_effort="{validate_effort(effort)}"'])
+            cmd.extend(["-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
+                        "--json", "-o", str(output_path), *review_args])
+        else:
+            opts = dict(codex_bin=binary, model=model, effort=effort, sandbox=sandbox, network=network,
+                        report_path=output_path, is_git_repo=is_git_repo)
+            if session_id:
+                cmd = build_codex_resume_cmd(session_id=session_id, **opts)
+            else:
+                cmd = build_codex_exec_cmd(workdir=workdir, **opts)
+        catalog = codex_catalog_override(engine["configFilePath"])
+        if catalog and Path(catalog).is_file():
+            cmd[1:1] = ["-c", "model_catalog_json=" + json.dumps(catalog, ensure_ascii=False)]
+        return cmd
+    if engine["kind"] == "zcode":
+        cmd = [get_node_bin() or "node", binary]
+        if session_id:
+            cmd.extend(["--resume", session_id])
+        return cmd + ["-p", prompt, "--cwd", str(workdir), "--mode", "plan" if sandbox == "read-only" else "build",
+                      "--json", "--no-color"]
+    return build_generic_cli_cmd(generic_template(engine, sandbox, session_id), bin_path=binary,
+                                 prompt=prompt, cwd=workdir, model=model, effort=effort,
+                                 sandbox=sandbox, session_id=session_id)
+
+
+def run_generic_cli_with_failover(*, engine, routing, workdir, prompt, sandbox, run_dir, timeout,
+                                  session_id=None, network=False, is_git_repo=False, review_args=None, dry_run=False):
+    """Preview or run the same argv for each model, collecting per-attempt outcomes across CLI adapters."""
+    kind = engine["kind"]
+    binary = engine_bin(engine)
+    if not dry_run and (not binary or (kind == "zcode" and not get_node_bin())):
+        raise ValueError(f"CLI runtime not found for engine '{engine['id']}'")
+    binary = binary or os.path.expanduser(engine["binPath"]) or engine["id"]
+    output = run_dir / ("review_output.txt" if review_args is not None else "last_message.json")
+    attempts = []
+    candidates = routing["fallback_chain"][:MAX_FAILOVER_ATTEMPTS]
+    for candidate in candidates:
+        model, effort = candidate["full_model"], candidate["effort"]
+        cmd = engine_command(engine, binary=binary, workdir=workdir, prompt=prompt, model=model, effort=effort,
+                             sandbox=sandbox, network=network, output_path=output, is_git_repo=is_git_repo,
+                             session_id=session_id, review_args=review_args)
+        if dry_run:
+            return {"command": cmd}
+        env = None
+        if kind == "zcode":
+            override = write_zcode_run_provider_config(run_dir, candidate["provider_id"], candidate["model_id"],
+                                                      effort, engine["configFilePath"])
+            env = build_zcode_env(override)
+        if kind == "codex":
+            output.unlink(missing_ok=True)  # A failed primary can leave its report behind.
+        stdin_text = prompt if kind == "codex" and cmd[-1] == "-" else None
+        rc, stdout, stderr, timed_out = run_subprocess_with_timeout(cmd, cwd=workdir, stdin_text=stdin_text,
+                                                                  timeout=timeout, env=env)
+        attempts.append({"attempt": len(attempts) + 1, **candidate, "exit_code": rc, "timed_out": timed_out})
         if rc == 0 and not timed_out:
             break
-
-    routing["model"] = used_candidate["full_model"]
-    routing["model_id"] = used_candidate["model_id"]
-    routing["provider_id"] = used_candidate["provider_id"]
-    routing["provider_label"] = used_candidate["provider_label"]
-    routing["effort"] = used_candidate.get("effort", "max")
-    routing["attempts"] = attempts
-    routing["failover_triggered"] = len(attempts) > 1
-
-    return {
-        "rc": last_rc,
-        "stdout": last_stdout,
-        "stderr": last_stderr,
-        "timed_out": last_timed_out,
-        "model_used": used_candidate["full_model"],
-        "effort_used": used_candidate.get("effort", "max"),
-    }
+    routing.update(model=model, effort=effort, attempts=attempts, failover_triggered=len(attempts) > 1)
+    if kind == "zcode":
+        routing.update({k: candidate[k] for k in ("provider_id", "provider_label", "model_id")})
+    (run_dir / "events.jsonl").write_text(stdout, encoding="utf-8")
+    (run_dir / "stderr.log").write_text(stderr, encoding="utf-8")
+    if kind == "codex":
+        parsed = parse_codex_events(stdout)
+        if review_args is not None:
+            summary = (output.read_text(encoding="utf-8", errors="replace").strip() if output.exists()
+                       else parsed["last_agent_text"] or stderr.strip())
+            report = {"summary": summary, "status": "completed" if rc == 0 else "failed"}
+        else:
+            report = parse_report_file(output, parsed["last_agent_text"], stderr, rc, parsed["errors"])
+    else:
+        parsed = parse_generic_cli_output(stdout, stderr, rc)
+        report = parsed["report"]
+    if rc != 0:
+        report.update(status="failed", verification_passed=False)
+    return {"exit_code": rc, "timed_out": timed_out, "session_id": parsed["session_id"] or session_id,
+            "usage": parsed["usage"], "report": report, "model_used": model, "effort_used": effort}
 
 
 def execute_single_task(
@@ -1665,77 +2018,23 @@ def execute_single_task(
     if network and sandbox != "workspace-write":
         raise ValueError("--network requires --sandbox workspace-write.")
 
+    config = load_engine_config()
+    target = resolve_run_target(backend, prompt, files_hint, difficulty, prefer_wide, model, effort, config)
+    backend, engine = target["backend"], target["engine"]
     git_info = inspect_git(cwd)
+    if isolation == "auto" and config["policy"]["defaultIsolation"] == "inplace":
+        isolation = "inplace"
     eff_isolation, isolation_reason = resolve_isolation(isolation, sandbox, git_info)
     tid = task_id or make_task_id("run")
-
-    if backend == "codex":
-        codex_bin = get_codex_bin()
-        if not codex_bin:
-            raise RuntimeError("codex CLI not found")
-        routing = resolve_model_and_effort(
-            difficulty=difficulty,
-            prompt=prompt,
-            files_hint=files_hint,
-            explicit_model=model,
-            explicit_effort=effort,
-            quality=quality,
-            alternate=alternate,
-            prefer_wide=prefer_wide,
-        )
-        model_used = routing["model"]
-        effort_used = routing["effort"]
-    else:
-        node_bin = get_node_bin()
-        if not node_bin or not ZCODE_SCRIPT.exists():
-            raise RuntimeError("ZCode runtime (node or zcode.cjs) not found")
-        routing = resolve_zcode_model_and_fallbacks(
-            difficulty=difficulty,
-            prompt=prompt,
-            files_hint=files_hint,
-            explicit_model=model,
-            explicit_effort=effort,
-            prefer_wide=prefer_wide,
-            is_review=False,
-        )
-        model_used = routing["model"]
-        effort_used = routing["effort"]
-
+    routing = plan_routing(target, config, prompt=prompt, difficulty=difficulty, quality=quality,
+                           alternate=alternate, files_hint=files_hint, prefer_wide=prefer_wide)
     run_dir = RUNS_DIR / tid
-    report_path = run_dir / "last_message.json"
-    worker_prompt = build_worker_prompt(prompt, sandbox=sandbox, network=network, is_resume=False, files_hint=files_hint)
-
+    worker_prompt = build_worker_prompt(prompt, sandbox=sandbox, network=network, files_hint=files_hint)
+    options = dict(engine=engine, routing=routing, prompt=worker_prompt, sandbox=sandbox, network=network,
+                   run_dir=run_dir, timeout=timeout, is_git_repo=git_info["is_git_repo"])
     if dry_run:
-        preview_workdir = (
-            WORKTREES_DIR / (Path(git_info["repo_root"]).name if git_info["repo_root"] else "repo") / tid
-            if eff_isolation == "worktree"
-            else cwd
-        )
-        if backend == "codex":
-            preview_cmd = build_codex_exec_cmd(
-                codex_bin=get_codex_bin() or "codex",
-                workdir=preview_workdir,
-                model=model_used,
-                effort=effort_used,
-                sandbox=sandbox,
-                network=network,
-                report_path=report_path,
-                is_git_repo=git_info["is_git_repo"],
-            )
-        else:
-            zmode = "plan" if sandbox == "read-only" else "build"
-            preview_cmd = [
-                get_node_bin() or "node",
-                str(ZCODE_SCRIPT),
-                "-p",
-                "<prompt>",
-                "--cwd",
-                str(preview_workdir),
-                "--mode",
-                zmode,
-                "--json",
-                "--no-color",
-            ]
+        preview_workdir = WORKTREES_DIR / Path(git_info["repo_root"]).name / tid if eff_isolation == "worktree" else cwd
+        preview = run_generic_cli_with_failover(**options, workdir=preview_workdir, dry_run=True)
         return {
             "dry_run": True,
             "task_id": tid,
@@ -1747,9 +2046,11 @@ def execute_single_task(
             "network": network,
             "git": git_info,
             "preview_workdir": str(preview_workdir),
-            "command": preview_cmd,
+            **preview,
         }
 
+    if not is_engine_available(engine):
+        raise ValueError(f"CLI runtime not found for engine '{backend}'")
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.txt").write_text(worker_prompt, encoding="utf-8")
 
@@ -1762,62 +2063,16 @@ def execute_single_task(
         worktree_path = str(wt)
         branch_name = br
 
+    execution = run_generic_cli_with_failover(**options, workdir=workdir)
+    model_used, effort_used = execution["model_used"], execution["effort_used"]
+    report, session_id = execution["report"], execution["session_id"]
+    rc, timed_out = execution["exit_code"], execution["timed_out"]
     desktop_synced = False
-    if backend == "codex":
-        cmd = build_codex_exec_cmd(
-            codex_bin=get_codex_bin(),  # type: ignore[arg-type]
-            workdir=workdir,
-            model=model_used,
-            effort=effort_used,
-            sandbox=sandbox,
-            network=network,
-            report_path=report_path,
-            is_git_repo=git_info["is_git_repo"],
-        )
-        rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
-            cmd, cwd=workdir, stdin_text=worker_prompt, timeout=timeout
-        )
-        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
-        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
-        parsed_events = parse_codex_events(stdout_text)
-        report = parse_report_file(
-            report_path,
-            parsed_events["last_agent_text"],
-            stderr_text,
-            rc,
-            event_errors=parsed_events["errors"],
-        )
-        session_id = parsed_events["session_id"]
-        usage = parsed_events["usage"]
-    else:
-        zmode = "plan" if sandbox == "read-only" else "build"
-        z_exec = run_zcode_with_failover(
-            node_bin=get_node_bin(),  # type: ignore[arg-type]
-            prompt_text=worker_prompt,
-            workdir=workdir,
-            zmode=zmode,
-            routing=routing,
-            run_dir=run_dir,
-            timeout=timeout,
-        )
-        rc = z_exec["rc"]
-        stdout_text = z_exec["stdout"]
-        stderr_text = z_exec["stderr"]
-        timed_out = z_exec["timed_out"]
-        model_used = z_exec["model_used"]
-        effort_used = z_exec["effort_used"]
-        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
-        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
-        z_parsed = parse_zcode_output(stdout_text, stderr_text, rc)
-        report = z_parsed["report"]
-        session_id = z_parsed["session_id"]
-        usage = z_parsed["usage"]
-
     git_truth = collect_git_truth(workdir, git_info["head_sha"])
     now = utc_now()
     final_status = "timed_out" if timed_out else report.get("status", "completed" if rc == 0 else "failed")
 
-    if backend == "zcode" and session_id:
+    if engine["kind"] == "zcode" and engine["adapter"]["syncDesktopIndex"] and session_id:
         desktop_synced = sync_zcode_session_to_desktop_index(
             session_id=session_id,
             workspace_path=Path(git_info["repo_root"]) if git_info.get("repo_root") else cwd,
@@ -1855,9 +2110,6 @@ def execute_single_task(
         "run_dir": str(run_dir),
     }
 
-    with locked_state() as state:
-        state["tasks"][tid] = task_record
-
     result = {
         "task_id": tid,
         "backend": backend,
@@ -1874,7 +2126,7 @@ def execute_single_task(
         "desktop_synced": desktop_synced,
         "exit_code": rc,
         "timed_out": timed_out,
-        "usage": usage,
+        "usage": execution["usage"],
         "report": report,
         "git_truth": git_truth,
         "run_dir": str(run_dir),
@@ -1882,36 +2134,85 @@ def execute_single_task(
     (run_dir / "result.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    with locked_state() as state:
+        state["tasks"][tid] = task_record
     return result
 
 
+def generic_model_ids(engine: dict) -> set[str]:
+    ids = {engine["models"]["primaryModel"], engine["models"]["fallbackModel"]}
+    if engine["id"] == "claude":
+        ids.update(("claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"))
+    if engine["id"] == "gemini":
+        ids.update(("gemini-2.5-pro", "gemini-2.5-flash"))
+
+    def add_model(item):
+        if isinstance(item, dict):
+            item = next((item[k] for k in ("id", "modelId", "model_id", "slug", "name") if item.get(k)), None)
+        if isinstance(item, str) and item.strip():
+            ids.add(item.strip())
+
+    def visit(value):
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                field = key.lower().replace("_", "").replace("-", "")
+                if field.endswith(("model", "modelid", "modelname")):
+                    add_model(child)
+                elif field in ("models", "modelids", "modelorder", "availablemodels", "modelnames"):
+                    if isinstance(child, (list, dict)):
+                        for item in child:
+                            add_model(item)
+                visit(child)
+
+    if engine["configFilePath"]:
+        try:
+            raw = json.loads(Path(engine["configFilePath"]).expanduser().read_text(encoding="utf-8"))
+            visit({"models": raw} if isinstance(raw, list) else raw)
+        except (OSError, ValueError):
+            pass
+    return ids - {"", "auto"}
+
+
 def cmd_health(_args: argparse.Namespace) -> int:
+    config = load_engine_config()
+    entries = {e["id"]: e for e in config["engines"]}
     candidates = list_codex_candidates()
-    codex_bin = get_codex_bin()
+    codex_bin = engine_bin(entries["codex"])
     node_bin = get_node_bin()
     git_bin = get_git_bin()
-    zcode_exists = ZCODE_SCRIPT.exists()
-
+    zscript = Path(entries["zcode"]["binPath"] or ZCODE_SCRIPT).expanduser()
+    zcode_exists = zscript.is_file()
     codex_ver = probe_version([codex_bin, "--version"]) if codex_bin else None
     node_ver = probe_version([node_bin, "--version"]) if node_bin else None
     git_ver = probe_version([git_bin, "--version"]) if git_bin else None
-    zcode_ver = (
-        probe_version([node_bin, str(ZCODE_SCRIPT), "--version"])
-        if (node_bin and zcode_exists)
-        else None
-    )
-    frontier = discover_frontier_models()
-    zcode_models = discover_zcode_models()
-
-    healthy = bool(
-        codex_bin
-        and codex_ver
-        and git_bin
-        and SCHEMA_PATH.exists()
-    )
-
+    zcode_ver = probe_version([node_bin, str(zscript), "--version"]) if node_bin and zcode_exists else None
+    frontier = discover_frontier_models(entries["codex"]["configFilePath"])
+    zcode_models = discover_zcode_models(entries["zcode"]["configFilePath"])
+    engines = {}
+    for key, engine in entries.items():
+        if key == "codex":
+            binary = codex_bin
+            exists = any(p.is_file() for p in codex_cache_paths(engine["configFilePath"]))
+            count = len(frontier["listed_models"])
+        elif key == "zcode":
+            binary = str(zscript) if zcode_exists else None
+            exists = zcode_config_path(engine["configFilePath"]).is_file()
+            count = sum(len(p["models"]) for p in zcode_models["providers"])
+        else:
+            binary = engine_bin(engine)
+            exists = bool(engine["configFilePath"] and Path(engine["configFilePath"]).expanduser().is_file())
+            count = len(generic_model_ids(engine))
+        engines[key] = {"id": key, "enabled": engine["enabled"], "detected_bin": binary,
+                        "available": bool(binary and (key != "zcode" or node_bin)),
+                        "config_exists": exists, "models_count": count}
+    healthy = bool(git_bin and SCHEMA_PATH.exists() and any(e["enabled"] and e["available"] for e in engines.values()))
     payload = {
         "healthy": healthy,
+        "engines": engines,
+        "workflow_roles": config["workflowRoles"],
         "schema_exists": SCHEMA_PATH.exists(),
         "state_dir": str(STATE_DIR),
         "default_quality_mode": "smart",
@@ -1919,7 +2220,7 @@ def cmd_health(_args: argparse.Namespace) -> int:
         "zcode": {
             "node_bin": node_bin,
             "node_version": node_ver,
-            "script": str(ZCODE_SCRIPT),
+            "script": str(zscript),
             "script_exists": zcode_exists,
             "version": zcode_ver,
             "cli_db_exists": ZCODE_CLI_DB.exists(),
@@ -1988,7 +2289,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
         res = execute_single_task(
             prompt=item["prompt"],
             cwd=item_cwd,
-            backend=item.get("backend", "codex"),
+            backend=item.get("backend", args.backend),
             difficulty=item.get("difficulty", "auto"),
             model=item.get("model"),
             effort=item.get("effort"),
@@ -2033,187 +2334,60 @@ def cmd_resume(args: argparse.Namespace) -> int:
         if not task_record:
             raise ValueError(f"Unknown task_id: {args.task_id}")
 
-    session_id = args.session_id or (task_record["session_id"] if task_record else None)
+    session_id = args.session_id or (task_record or {}).get("session_id")
     if not session_id:
         raise ValueError("No session_id available to resume (pass --session-id or valid --task-id).")
-
-    inferred_backend = "zcode" if session_id.startswith("sess_") else "codex"
-    backend = args.backend or (task_record["backend"] if task_record else inferred_backend)
-
-    workdir = Path(args.cwd or (task_record["workdir"] if task_record else ".")).resolve()
-    if not workdir.exists():
+    # Find the original registry entry for session-only resumes, including custom sessions.
+    if not task_record:
+        with locked_state() as state:
+            task_record = next((t for t in state["tasks"].values() if t.get("session_id") == session_id
+                                and args.backend in (None, "auto", t.get("backend"))), None)
+    original = task_record or {}
+    config = load_engine_config()
+    inferred_backend = original.get("backend") or ("zcode" if session_id.startswith("sess_") else "codex")
+    backend = args.backend if args.backend not in (None, "auto") else inferred_backend
+    if task_record and backend != inferred_backend:
+        raise ValueError(f"Task belongs to engine '{inferred_backend}', not '{backend}'")
+    workdir = Path(args.cwd or original.get("workdir") or ".").resolve()
+    if not workdir.is_dir():
         raise ValueError(f"Workdir does not exist: {workdir}")
-
-    sandbox = args.sandbox or (task_record["sandbox"] if task_record else "workspace-write")
-    network = args.network if args.network is not None else bool(task_record.get("network", False) if task_record else False)
+    sandbox = args.sandbox or original.get("sandbox", "workspace-write")
+    network = args.network if args.network is not None else sandbox == "workspace-write" and original.get("network", False)
     if network and sandbox != "workspace-write":
         raise ValueError("--network requires --sandbox workspace-write.")
-    base_sha = task_record.get("base_sha") if task_record else None
+    base_sha = original.get("base_sha")
     git_info = inspect_git(workdir)
-
-    if backend == "codex":
-        codex_bin = get_codex_bin()
-        if not codex_bin:
-            raise RuntimeError("codex CLI not found")
-        if args.model or args.effort or args.difficulty != "auto" or args.prefer_wide or args.quality != "smart":
-            routing = resolve_model_and_effort(
-                difficulty=args.difficulty,
-                prompt=prompt_text,
-                explicit_model=args.model,
-                explicit_effort=args.effort,
-                quality=args.quality,
-                alternate=args.alternate,
-                prefer_wide=args.prefer_wide,
-            )
-            model_used = routing["model"]
-            effort_used = routing["effort"]
-        elif task_record:
-            model_used = task_record["model"]
-            effort_used = task_record["effort"]
-            routing = {
-                "effective_difficulty": task_record.get("difficulty", "medium"),
-                "quality_mode": args.quality,
-                "model": model_used,
-                "effort": effort_used,
-                "route_note": "inherited model/effort from original task",
-            }
-        else:
-            routing = resolve_model_and_effort(
-                difficulty="auto",
-                prompt=prompt_text,
-                quality=args.quality,
-                alternate=args.alternate,
-                prefer_wide=args.prefer_wide,
-            )
-            model_used = routing["model"]
-            effort_used = routing["effort"]
-    else:
-        node_bin = get_node_bin()
-        if not node_bin or not ZCODE_SCRIPT.exists():
-            raise RuntimeError("ZCode runtime not found")
-        inherited_model = args.model or (task_record.get("model") if task_record else None)
-        routing = resolve_zcode_model_and_fallbacks(
-            difficulty=args.difficulty,
-            prompt=prompt_text,
-            explicit_model=inherited_model,
-            explicit_effort=args.effort,
-            prefer_wide=args.prefer_wide,
-            is_review=False,
-        )
-        model_used = routing["model"]
-        effort_used = routing["effort"]
-
-    resume_tid = args.task_id or make_task_id("resume")
+    inherit = args.difficulty == "auto" and not args.prefer_wide and args.quality == "smart"
+    target = resolve_run_target(backend, prompt_text, None, args.difficulty, args.prefer_wide,
+                                args.model or (original.get("model") if inherit else None),
+                                args.effort or (original.get("effort") if inherit else None), config)
+    engine = target["engine"]
+    routing = plan_routing(target, config, prompt=prompt_text, difficulty=args.difficulty, quality=args.quality,
+                           alternate=args.alternate, prefer_wide=args.prefer_wide)
+    resume_tid = args.task_id or original.get("task_id") or make_task_id("resume")
     turn_id = make_task_id("turn")
-    run_dir = RUNS_DIR / resume_tid / turn_id
-    report_path = run_dir / "last_message.json"
+    run_dir = Path(original.get("run_dir") or RUNS_DIR / resume_tid) / turn_id
     worker_prompt = build_worker_prompt(prompt_text, sandbox=sandbox, network=network, is_resume=True)
-
+    options = dict(engine=engine, routing=routing, workdir=workdir, prompt=worker_prompt, sandbox=sandbox,
+                   network=network, run_dir=run_dir, timeout=args.timeout, session_id=session_id,
+                   is_git_repo=git_info["is_git_repo"])
     if args.dry_run:
-        if backend == "codex":
-            preview_cmd = build_codex_resume_cmd(
-                codex_bin=get_codex_bin() or "codex",
-                session_id=session_id,
-                model=model_used,
-                effort=effort_used,
-                sandbox=sandbox,
-                network=network,
-                report_path=report_path,
-                is_git_repo=git_info["is_git_repo"],
-            )
-        else:
-            zmode = "plan" if sandbox == "read-only" else "build"
-            preview_cmd = [
-                get_node_bin() or "node",
-                str(ZCODE_SCRIPT),
-                "--resume",
-                session_id,
-                "-p",
-                "<prompt>",
-                "--cwd",
-                str(workdir),
-                "--mode",
-                zmode,
-                "--json",
-                "--no-color",
-            ]
-        print(
-            json.dumps(
-                {
-                    "dry_run": True,
-                    "task_id": resume_tid,
-                    "backend": backend,
-                    "session_id": session_id,
-                    "workdir": str(workdir),
-                    "network": network,
-                    "routing": routing,
-                    "command": preview_cmd,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
+        preview = run_generic_cli_with_failover(**options, dry_run=True)
+        print(json.dumps({"dry_run": True, "task_id": resume_tid, "backend": backend, "session_id": session_id,
+                          "workdir": str(workdir), "sandbox": sandbox, "network": network, "routing": routing,
+                          **preview}, ensure_ascii=False, indent=2))
         return 0
-
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.txt").write_text(worker_prompt, encoding="utf-8")
-
+    execution = run_generic_cli_with_failover(**options)
+    model_used, effort_used = execution["model_used"], execution["effort_used"]
+    report, new_session_id = execution["report"], execution["session_id"]
+    rc, timed_out = execution["exit_code"], execution["timed_out"]
     desktop_synced = False
-    if backend == "codex":
-        cmd = build_codex_resume_cmd(
-            codex_bin=get_codex_bin(),  # type: ignore[arg-type]
-            session_id=session_id,
-            model=model_used,
-            effort=effort_used,
-            sandbox=sandbox,
-            network=network,
-            report_path=report_path,
-            is_git_repo=git_info["is_git_repo"],
-        )
-        rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
-            cmd, cwd=workdir, stdin_text=worker_prompt, timeout=args.timeout
-        )
-        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
-        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
-        parsed_events = parse_codex_events(stdout_text)
-        report = parse_report_file(
-            report_path,
-            parsed_events["last_agent_text"],
-            stderr_text,
-            rc,
-            event_errors=parsed_events["errors"],
-        )
-        new_session_id = parsed_events["session_id"] or session_id
-        usage = parsed_events["usage"]
-    else:
-        zmode = "plan" if sandbox == "read-only" else "build"
-        z_exec = run_zcode_with_failover(
-            node_bin=get_node_bin(),  # type: ignore[arg-type]
-            prompt_text=worker_prompt,
-            workdir=workdir,
-            zmode=zmode,
-            routing=routing,
-            run_dir=run_dir,
-            timeout=args.timeout,
-            resume_session_id=session_id,
-        )
-        rc = z_exec["rc"]
-        stdout_text = z_exec["stdout"]
-        stderr_text = z_exec["stderr"]
-        timed_out = z_exec["timed_out"]
-        model_used = z_exec["model_used"]
-        effort_used = z_exec["effort_used"]
-        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
-        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
-        z_parsed = parse_zcode_output(stdout_text, stderr_text, rc)
-        report = z_parsed["report"]
-        new_session_id = z_parsed["session_id"] or session_id
-        usage = z_parsed["usage"]
-
     git_truth = collect_git_truth(workdir, base_sha)
     final_status = "timed_out" if timed_out else report.get("status", "completed" if rc == 0 else "failed")
 
-    if backend == "zcode" and new_session_id:
+    if engine["kind"] == "zcode" and engine["adapter"]["syncDesktopIndex"] and new_session_id:
         ws_root = (
             Path(task_record["repo_root"])
             if (task_record and task_record.get("repo_root"))
@@ -2231,18 +2405,6 @@ def cmd_resume(args: argparse.Namespace) -> int:
             worktree_root=task_record.get("worktree_path") if task_record else None,
         )
 
-    if task_record:
-        with locked_state() as state:
-            if resume_tid in state["tasks"]:
-                state["tasks"][resume_tid]["model"] = model_used
-                state["tasks"][resume_tid]["effort"] = effort_used
-                state["tasks"][resume_tid]["sandbox"] = sandbox
-                state["tasks"][resume_tid]["network"] = network
-                state["tasks"][resume_tid]["session_id"] = new_session_id
-                state["tasks"][resume_tid]["desktop_synced"] = desktop_synced
-                state["tasks"][resume_tid]["status"] = final_status
-                state["tasks"][resume_tid]["updated_at"] = utc_now()
-
     result = {
         "task_id": resume_tid,
         "turn_id": turn_id,
@@ -2257,7 +2419,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         "desktop_synced": desktop_synced,
         "exit_code": rc,
         "timed_out": timed_out,
-        "usage": usage,
+        "usage": execution["usage"],
         "report": report,
         "git_truth": git_truth,
         "run_dir": str(run_dir),
@@ -2265,6 +2427,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
     (run_dir / "result.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    if task_record:
+        with locked_state() as state:
+            if resume_tid in state["tasks"]:
+                record = state["tasks"][resume_tid]
+                record.update(model=model_used, effort=effort_used, session_id=new_session_id, desktop_synced=desktop_synced,
+                              status=final_status, exit_code=rc, updated_at=utc_now())
+                if args.task_id:
+                    record.update(sandbox=sandbox, network=network)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if rc == 0 else 1
 
@@ -2284,197 +2454,79 @@ def cmd_review(args: argparse.Namespace) -> int:
     base_sha = args.base or (task_record.get("base_sha") if task_record else None)
     git_truth = collect_git_truth(workdir, base_sha)
 
-    # Heterogeneous cross-engine review when --backend auto is used (respecting optional ZCode toggle)
-    engine_cfg = load_engine_config()
-    zcode_cfg = engine_cfg.get("zcode") if isinstance(engine_cfg.get("zcode"), dict) else {}
-    policy_cfg = engine_cfg.get("policy") if isinstance(engine_cfg.get("policy"), dict) else {}
-    zcode_enabled = bool(zcode_cfg.get("enabled", True)) and bool(get_node_bin()) and ZCODE_SCRIPT.exists()
-    review_policy = str(policy_cfg.get("reviewPolicy") or "heterogeneous")
-
-    author_backend = task_record.get("backend") if task_record else None
-    if args.backend == "auto":
-        if review_policy == "codex_only" or not zcode_enabled:
-            backend = "codex"
-        elif author_backend == "codex" and zcode_enabled:
-            backend = "zcode"
-        elif author_backend == "zcode" and get_codex_bin():
-            backend = "codex"
-        elif zcode_enabled:
-            backend = "zcode"
-        else:
-            backend = "codex"
+    config = load_engine_config()
+    roles = config["workflowRoles"]
+    reviewer = roles["reviewer"]
+    author_backend = (task_record or {}).get("backend") or roles["primaryBuilder"]["engineId"]
+    auto = args.backend == "auto"
+    reviewer_mode = reviewer["mode"] if auto else "explicit"
+    if reviewer_mode == "explicit":
+        backend = reviewer["engineId"] if auto else args.backend
+        review_note = f"Explicit read-only reviewer: {backend}."
     else:
-        backend = args.backend
-
-    zcode_routing: dict[str, Any] | None = None
-    if backend == "codex":
-        codex_bin = get_codex_bin()
-        if not codex_bin:
-            raise RuntimeError("codex CLI not found")
-        frontier = discover_frontier_models()
-        flagship = frontier["flagship"]
-        wide_fast = frontier["wide_fast"]
-        flagship_slug = flagship["slug"] if flagship else None
-        wide_slug = wide_fast["slug"] if wide_fast else None
-        author_model = task_record.get("model") if task_record else None
-
-        if args.model:
-            review_model = args.model
-        elif author_model and flagship_slug and author_model == flagship_slug and wide_slug and wide_slug != flagship_slug:
-            review_model = wide_slug
-        elif author_model and wide_slug and author_model == wide_slug and flagship_slug:
-            review_model = flagship_slug
+        active = [e for e in config["engines"] if e["enabled"]]
+        others = [e for e in active if e["id"] != author_backend]
+        if others:
+            backend = next((e for e in others if is_engine_available(e)), others[0])["id"]
+            review_note = f"Heterogeneous read-only review: {author_backend} -> {backend}."
         else:
-            review_model = flagship_slug
-
-        if args.effort:
-            review_effort = args.effort
-        else:
-            matched = next((m for m in frontier["listed_models"] if m["slug"] == review_model), flagship)
-            effs = matched["supported_efforts"] if matched else []
-            chain = ("max", "xhigh", "high") if args.quality == "max" else ("high", "xhigh", "medium")
-            review_effort = pick_supported_effort(chain, effs)
-    else:
-        node_bin = get_node_bin()
-        if not node_bin or not ZCODE_SCRIPT.exists():
-            raise RuntimeError("ZCode runtime not found")
-        zcode_routing = resolve_zcode_model_and_fallbacks(
-            difficulty="hard",
-            prompt=args.prompt or "code review",
-            explicit_model=args.model,
-            explicit_effort=args.effort,
-            prefer_wide=False,
-            is_review=True,
-        )
-        review_model = zcode_routing["model"]
-        review_effort = zcode_routing["effort"]
-
+            backend = active[0]["id"]
+            review_note = f"Only {backend} is enabled; read-only self-review."
+    model = selected_model(args.model) or (selected_model(reviewer["model"]) if auto and reviewer_mode == "explicit" else None)
+    effort = args.effort or (reviewer["effort"] if auto else None)
+    target = resolve_run_target(backend, args.prompt or "code review", None, "hard", False, model, effort, config)
+    engine = target["engine"]
+    if engine["kind"] == "codex" and not target["model"] and not selected_model(engine["models"]["primaryModel"]):
+        frontier = discover_frontier_models(engine["configFilePath"])
+        flagship, wide = frontier["flagship"], frontier["wide_fast"]
+        if flagship and wide and (task_record or {}).get("model") == flagship["slug"]:
+            target["model"] = wide["slug"]
+    routing = plan_routing(target, config, prompt=args.prompt or "code review", difficulty="hard",
+                           quality=args.quality, review=True)
     review_id = make_task_id("review")
     run_dir = RUNS_DIR / review_id
-    review_out = run_dir / "review_output.txt"
-
     review_prompt = args.prompt or (
         "请对当前工作区相对基准提交 "
-        f"{base_sha or 'HEAD'} 的代码改动执行严格的只读异构代码审计（Code Review）。"
+        f"{base_sha or 'HEAD'} 的源码改动执行严格的只读代码审计（Code Review，忽略 dist/、node_modules/ 等编译打包产物）。"
         "重点排查：1) 会算错钱、丢数据、越权、发错消息或导致线上故障的严重问题（写清具体触发路径）；"
         "2) 边界条件遗漏、并发/状态同步缺陷与未覆盖的测试；3) 给出明确结论（通过 / 需修复项）。"
     )
 
-    if backend == "codex":
-        cmd = [
-            get_codex_bin() or "codex",
-            "exec",
-            "review",
-        ]
-        if review_model:
-            cmd.extend(["-m", review_model])
-        if review_effort:
-            cmd.extend(["-c", f'model_reasoning_effort="{review_effort}"'])
-        cmd.extend([
-            "-c",
-            'sandbox_mode="read-only"',
-            "-c",
-            'approval_policy="never"',
-            "--json",
-            "-o",
-            str(review_out),
-        ])
-        if git_truth.get("has_new_commits") and base_sha and not args.uncommitted:
-            cmd.extend(["--base", base_sha])
-        else:
-            cmd.append("--uncommitted")
-        if not git_truth.get("is_git"):
-            cmd.append("--skip-git-repo-check")
-        if args.prompt and not (base_sha or args.uncommitted):
-            cmd.append("-")
-            stdin_prompt = args.prompt
-        else:
-            stdin_prompt = None
+    review_base = base_sha if git_truth.get("has_new_commits") and not args.uncommitted else None
+    review_args = [] if git_truth.get("is_git") else ["--skip-git-repo-check"]
+    if args.prompt and engine["kind"] == "codex":
+        # Codex review accepts either a scope flag or custom instructions on stdin.
+        scope = f"changes relative to {review_base}" if review_base else "uncommitted changes"
+        review_prompt = f"Review the {scope}.\n\n{args.prompt}"
+        review_args.append("-")
+    elif review_base:
+        review_args.extend(["--base", review_base])
     else:
-        cmd = [
-            get_node_bin() or "node",
-            str(ZCODE_SCRIPT),
-            "-p",
-            review_prompt,
-            "--cwd",
-            str(workdir),
-            "--mode",
-            "plan",
-            "--json",
-            "--no-color",
-        ]
-        stdin_prompt = None
-
+        review_args.append("--uncommitted")
+    options = dict(engine=engine, routing=routing, workdir=workdir, prompt=review_prompt, sandbox="read-only",
+                   run_dir=run_dir, timeout=args.timeout, review_args=review_args)
+    context = {"review_id": review_id, "backend": backend, "author_backend": author_backend,
+               "reviewer_mode": reviewer_mode, "review_note": review_note, "sandbox": "read-only",
+               "routing": routing, "workdir": str(workdir)}
     if args.dry_run:
-        print(
-            json.dumps(
-                {
-                    "dry_run": True,
-                    "review_id": review_id,
-                    "backend": backend,
-                    "author_backend": author_backend,
-                    "review_model": review_model,
-                    "review_effort": review_effort,
-                    "routing": zcode_routing,
-                    "workdir": str(workdir),
-                    "command": cmd,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
+        preview = run_generic_cli_with_failover(**options, dry_run=True)
+        print(json.dumps({**context, **preview, "dry_run": True, "review_model": routing["model"],
+                          "review_effort": routing["effort"]}, ensure_ascii=False, indent=2))
         return 0
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    if backend == "codex":
-        rc, stdout_text, stderr_text, timed_out = run_subprocess_with_timeout(
-            cmd, cwd=workdir, stdin_text=stdin_prompt, timeout=args.timeout
-        )
-        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
-        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
-        parsed_events = parse_codex_events(stdout_text)
-        review_text = (
-            review_out.read_text(encoding="utf-8", errors="replace").strip()
-            if review_out.exists()
-            else (parsed_events["last_agent_text"] or "\n".join(stderr_text.splitlines()[-20:]))
-        )
-        usage = parsed_events["usage"]
-        session_id = parsed_events["session_id"]
-    else:
-        assert zcode_routing is not None
-        z_exec = run_zcode_with_failover(
-            node_bin=get_node_bin(),  # type: ignore[arg-type]
-            prompt_text=review_prompt,
-            workdir=workdir,
-            zmode="plan",
-            routing=zcode_routing,
-            run_dir=run_dir,
-            timeout=args.timeout,
-        )
-        rc = z_exec["rc"]
-        stdout_text = z_exec["stdout"]
-        stderr_text = z_exec["stderr"]
-        timed_out = z_exec["timed_out"]
-        review_model = z_exec["model_used"]
-        review_effort = z_exec["effort_used"]
-        (run_dir / "events.jsonl").write_text(stdout_text, encoding="utf-8")
-        (run_dir / "stderr.log").write_text(stderr_text, encoding="utf-8")
-        z_parsed = parse_zcode_output(stdout_text, stderr_text, rc)
-        review_text = z_parsed["report"]["summary"]
-        usage = z_parsed["usage"]
-        session_id = z_parsed["session_id"]
-        if session_id:
-            sync_zcode_session_to_desktop_index(
-                session_id=session_id,
-                workspace_path=workdir,
-                title_hint=f"[交叉代码审计] {args.task_id or workdir.name}",
-                model_full=review_model or "qwen-alibaba-model-studio-cn/deepseek-v4-pro-0813",
-                effort=review_effort or "max",
-                sandbox="read-only",
-                status="completed" if rc == 0 else "failed",
-                summary_text=review_text,
-            )
-
+    (run_dir / "prompt.txt").write_text(review_prompt, encoding="utf-8")
+    execution = run_generic_cli_with_failover(**options)
+    rc, timed_out = execution["exit_code"], execution["timed_out"]
+    review_model, review_effort = execution["model_used"], execution["effort_used"]
+    review_text = execution["report"]["summary"]
+    session_id = execution["session_id"]
+    desktop_synced = False
+    if engine["kind"] == "zcode" and engine["adapter"]["syncDesktopIndex"] and session_id:
+        desktop_synced = sync_zcode_session_to_desktop_index(
+            session_id=session_id, workspace_path=workdir, title_hint=f"[代码审查] {args.task_id or workdir.name}",
+            model_full=review_model, effort=review_effort, sandbox="read-only",
+            status="completed" if rc == 0 else "failed", summary_text=review_text)
     now = utc_now()
     final_status = "timed_out" if timed_out else ("completed" if rc == 0 else "failed")
     review_record = {
@@ -2494,29 +2546,22 @@ def cmd_review(args: argparse.Namespace) -> int:
         "sandbox": "read-only",
         "network": False,
         "session_id": session_id,
-        "desktop_synced": bool(backend == "zcode" and session_id),
+        "desktop_synced": desktop_synced,
         "status": final_status,
         "exit_code": rc,
         "created_at": now,
         "updated_at": now,
         "run_dir": str(run_dir),
     }
-    with locked_state() as state:
-        state["tasks"][review_id] = review_record
-
     payload = {
-        "review_id": review_id,
+        **context,
         "task_id": args.task_id,
-        "backend": backend,
-        "author_backend": author_backend,
         "review_model": review_model,
         "review_effort": review_effort,
-        "routing": zcode_routing,
-        "workdir": str(workdir),
         "session_id": session_id,
         "exit_code": rc,
         "timed_out": timed_out,
-        "usage": usage,
+        "usage": execution["usage"],
         "review_summary": review_text[:3000],
         "git_truth": git_truth,
         "run_dir": str(run_dir),
@@ -2527,12 +2572,14 @@ def cmd_review(args: argparse.Namespace) -> int:
             "commands_run": [],
             "verification_passed": rc == 0,
             "risks_or_followups": [],
-            "notes_for_orchestrator": f"Heterogeneous code review via {backend} ({review_model})",
+            "notes_for_orchestrator": review_note,
         },
     }
     (run_dir / "result.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    with locked_state() as state:
+        state["tasks"][review_id] = review_record
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0 if rc == 0 else 1
 
@@ -2607,24 +2654,24 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Local multi-agent dispatcher (Antigravity Brain -> Codex CLI & ZCode Hand)."
+        description="Local multi-agent dispatcher (workflow roles and registered CLI engines)."
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
 
-    sub.add_parser("health", help="Check local Codex, ZCode, Git, and model cache readiness.")
+    sub.add_parser("health", help="Check registered CLI engines, Git, and model discovery.")
 
     p_run = sub.add_parser(
         "run",
-        help="Dispatch one coding/analysis task to Codex or ZCode with dynamic model routing.",
+        help="Dispatch one coding/analysis task using workflow roles and model routing.",
     )
     p_run.add_argument("--cwd", default=".", help="Target repository or working directory.")
     p_run.add_argument("--prompt", required=True, help="Task prompt or '-' for stdin.")
-    p_run.add_argument("--backend", choices=VALID_BACKENDS, default="codex")
+    p_run.add_argument("--backend", default="auto", help="Registered engine ID or auto for workflow routing.")
     p_run.add_argument("--difficulty", choices=VALID_DIFFICULTIES, default="auto")
     p_run.add_argument("--quality", choices=VALID_QUALITIES, default="smart", help="Quality/quota routing mode (default: smart).")
     p_run.add_argument("--prefer-wide", action="store_true", help="Prefer largest-context model (gpt-6.2-sol 500k on Codex; glm-5.3 1M on ZCode).")
-    p_run.add_argument("--model", default=None, help="Explicit model slug override (supports Codex slugs or ZCode modelId / providerId/modelId).")
-    p_run.add_argument("--effort", default=None, help="Explicit reasoning effort override.")
+    p_run.add_argument("--model", type=validate_model, default=None, help="Explicit model slug override (supports Codex slugs or ZCode modelId / providerId/modelId).")
+    p_run.add_argument("--effort", choices=VALID_EFFORTS, default=None, help="Explicit reasoning effort override.")
     p_run.add_argument("--alternate", dest="alternate", action="store_true", default=None, help="Enable alternation across flagship/wide_fast on medium.")
     p_run.add_argument("--no-alternate", dest="alternate", action="store_false", help="Disable alternation on medium.")
     p_run.add_argument("--sandbox", choices=VALID_SANDBOXES, default="workspace-write")
@@ -2637,6 +2684,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_batch = sub.add_parser("batch", help="Dispatch parallel independent tasks from a JSON manifest.")
     p_batch.add_argument("--manifest", required=True, help="Path to JSON list or {tasks:[...]} file.")
+    p_batch.add_argument("--backend", default="auto", help="Default engine ID or auto for workflow routing.")
     p_batch.add_argument("--cwd", default=None, help="Default cwd when task item omits cwd.")
     p_batch.add_argument("--quality", choices=VALID_QUALITIES, default="smart")
     p_batch.add_argument("--network", action="store_true", help="Default network_access=true for batch tasks (overridable per item).")
@@ -2644,17 +2692,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch.add_argument("--timeout", type=int, default=600)
     p_batch.add_argument("--dry-run", action="store_true")
 
-    p_res = sub.add_parser("resume", help="Continue an existing Codex or ZCode worker session in its workdir.")
+    p_res = sub.add_parser("resume", help="Continue an existing worker session in its workdir.")
     p_res.add_argument("--task-id", default=None)
     p_res.add_argument("--session-id", default=None)
     p_res.add_argument("--cwd", default=None)
-    p_res.add_argument("--backend", choices=VALID_BACKENDS, default=None)
+    p_res.add_argument("--backend", default=None)
     p_res.add_argument("--prompt", required=True, help="Follow-up prompt or '-' for stdin.")
     p_res.add_argument("--difficulty", choices=VALID_DIFFICULTIES, default="auto")
     p_res.add_argument("--quality", choices=VALID_QUALITIES, default="smart")
     p_res.add_argument("--prefer-wide", action="store_true")
-    p_res.add_argument("--model", default=None)
-    p_res.add_argument("--effort", default=None)
+    p_res.add_argument("--model", type=validate_model, default=None)
+    p_res.add_argument("--effort", choices=VALID_EFFORTS, default=None)
     p_res.add_argument("--alternate", dest="alternate", action="store_true", default=None)
     p_res.add_argument("--no-alternate", dest="alternate", action="store_false")
     p_res.add_argument("--sandbox", choices=VALID_SANDBOXES, default=None)
@@ -2663,13 +2711,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_res.add_argument("--timeout", type=int, default=600)
     p_res.add_argument("--dry-run", action="store_true")
 
-    p_rev = sub.add_parser("review", help="Run non-interactive read-only heterogeneous code review (--backend auto/codex/zcode).")
+    p_rev = sub.add_parser("review", help="Run non-interactive read-only heterogeneous code review (--backend auto or an engine ID).")
     p_rev.add_argument("--task-id", default=None)
     p_rev.add_argument("--cwd", default=None)
-    p_rev.add_argument("--backend", choices=VALID_REVIEW_BACKENDS, default="auto")
+    p_rev.add_argument("--backend", default="auto")
     p_rev.add_argument("--quality", choices=VALID_QUALITIES, default="smart")
-    p_rev.add_argument("--model", default=None)
-    p_rev.add_argument("--effort", default=None)
+    p_rev.add_argument("--model", type=validate_model, default=None)
+    p_rev.add_argument("--effort", choices=VALID_EFFORTS, default=None)
     p_rev.add_argument("--base", default=None, help="Base Git branch or SHA.")
     p_rev.add_argument("--uncommitted", action="store_true")
     p_rev.add_argument("--prompt", default=None)
