@@ -8,8 +8,14 @@ import { renderPixelCat } from './cat-pet.js';
 
 const app = new App({ name: 'Antigravity Lead Codex', version: '1.3.1' }, {});
 const SLEEP_IDLE_MS = 12 * 60 * 1000;
-const TRACE_LABELS = new Map([['reasoning', '思考'], ['commandExecution', '命令'], ['fileChange', '文件']]);
-const DEFAULT_UI_PREFS = Object.freeze({ uiStyle: 'minimal', catEnabled: true, catLinkTaskStatus: false });
+const TRACE_LABELS = new Map([
+  ['reasoning', '思考'], ['commandExecution', '命令'], ['mcpToolCall', '工具'],
+  ['webSearch', '搜索'], ['fileChange', '文件'],
+]);
+const DEFAULT_UI_PREFS = Object.freeze({
+  uiStyle: 'minimal', catEnabled: true, catLinkTaskStatus: false,
+  progressCardEnabled: true, traceDisplayMode: 'grouped',
+});
 document.documentElement.dataset.uiStyle = DEFAULT_UI_PREFS.uiStyle;
 
 const MODE_TIPS = {
@@ -49,6 +55,9 @@ const state = {
   activeTab: 'tasks',
   detailSubTab: 'history',     // history | ops | git
   historyNewestFirst: true,
+  progressExpandedByThread: new Map(),
+  openTraceGroups: new Set(),
+  openTraceRows: new Set(),
   showDesktopTasks: null,
   showHiddenDrawer: false,
 
@@ -56,7 +65,6 @@ const state = {
   selectedAgentId: null,
   selectedBindingId: null,
   selectedDetail: null,
-  selectedGit: null,
 
   loadingSnapshot: false,
   sendingMessage: false,
@@ -257,7 +265,7 @@ async function refreshSnapshot({ silent = false } = {}) {
     state.runtime = data.runtime || {};
     state.codexEnv = data.codexEnv || null;
     if (data.uiPrefs && !state.savingPrefs && prefsRevision === state.prefsRevision) {
-      state.uiPrefs = data.uiPrefs;
+      state.uiPrefs = { ...DEFAULT_UI_PREFS, ...data.uiPrefs };
     }
     if (state.stats.runningCount || state.stats.runningOpsCount || state.stats.goalBlockedCount) {
       state.lastCatWakeMs = Date.now();
@@ -335,14 +343,12 @@ async function loadThreadDetail(threadId, { silent = false } = {}) {
   if (!threadId) return;
   if (state.selectedThreadId !== threadId) {
     state.selectedDetail = null;
-    state.selectedGit = null;
   }
   state.selectedThreadId = threadId;
   try {
     const detail = await callTool('get_codex_task_detail', { threadId });
     if (state.selectedThreadId !== threadId) return;
     state.selectedDetail = detail;
-    state.selectedGit = detail.git || null;
   } catch (err) {
     if (!silent) showToast(err.message, 'error');
   } finally {
@@ -736,45 +742,111 @@ function renderCollabLeftRail() {
 
 // ---------------- Right Detail Panes ----------------
 
+function renderProgressCard(progress, threadId) {
+  const { steps, statusCode, currentAction, summary } = progress;
+  const expanded = state.progressExpandedByThread.get(threadId) ?? (window.innerWidth > 640);
+  const hasSteps = steps.length > 0;
+  const running = statusCode === 'running' || statusCode === 'goal_active';
+  const marks = { done: '✓', in_progress: '●', failed: '✕', pending: '○' };
+  const labels = { done: '已完成', in_progress: '执行中', failed: '失败', pending: '待执行' };
+  return `
+    <div class="progress-dock">
+      <section class="progress-card" aria-label="任务进度">
+        ${hasSteps ? `<button type="button" class="progress-head" id="btnToggleProgress" aria-expanded="${expanded}">` : '<div class="progress-head static">'}
+          <span class="status-dot ${dotClass(statusCode)}" aria-hidden="true"></span>
+          <span class="progress-badge tone-${esc(progress.statusTone)}">${esc(progress.statusLabel)}</span>
+          <div class="progress-copy">
+            <span class="progress-summary">${esc(summary)}</span>
+            ${running && currentAction && currentAction !== summary ? `<div class="progress-live">${esc(currentAction)}</div>` : ''}
+          </div>
+          ${hasSteps ? `<span class="progress-count">${esc(progress.completedSteps)}/${esc(progress.totalSteps)} 步</span>
+            <span class="progress-caret" aria-hidden="true">${expanded ? '▴' : '▾'}</span></button>` : '</div>'}
+        ${hasSteps ? `<progress class="progress-bar" aria-label="已完成步骤" value="${esc(progress.completedSteps)}" max="${esc(steps.length)}"></progress>` : ''}
+        ${hasSteps && expanded ? `<ol class="progress-steps">${steps.map((step, i) => `
+          <li class="step-${esc(step.status)}"><span class="step-mark" aria-label="${esc(labels[step.status])}">${esc(marks[step.status])}</span>
+            <span>${i + 1}. ${esc(step.title)}</span></li>`).join('')}</ol>` : ''}
+      </section>
+    </div>`;
+}
+
+function historyKey(threadId, message) {
+  return JSON.stringify([threadId, message.turnId, message.id ?? message.ordinal]);
+}
+
+function renderTraceRow(message, threadId) {
+  const key = historyKey(threadId, message);
+  const firstLine = oneLineClean(message.text.split('\n')[0]).slice(0, 130);
+  return `<details class="trace-row" id="row-${esc(key)}" data-trace-row="${esc(key)}" ${state.openTraceRows.has(key) ? 'open' : ''}>
+    <summary id="row-head-${esc(key)}">
+      <span class="trace-kind">${esc(TRACE_LABELS.get(message.type))}</span>
+      <span class="trace-line">${esc(firstLine)}</span>
+      <span class="trace-time">${esc(clockTime(message.createdAtMs))}</span>
+    </summary>
+    <div class="trace-body">${esc(message.text)}</div>
+  </details>`;
+}
+
+function renderTraceGroup(items, threadId, before, after) {
+  // Both message boundaries survive a sort reversal. The closing boundary
+  // also identifies a group whose oldest items age out of the history window.
+  const oldest = state.historyNewestFirst ? items.at(-1) : items[0];
+  const latest = state.historyNewestFirst ? items[0] : items.at(-1);
+  const key = before ? 'after-' + historyKey(threadId, before) : 'from-' + historyKey(threadId, oldest);
+  const endKey = after ? 'before-' + historyKey(threadId, after) : !before ? 'start-' + threadId : '';
+  const isOpen = state.openTraceGroups.has(key) || state.openTraceGroups.has(endKey);
+  const counts = new Map();
+  for (const item of items) counts.set(item.type, (counts.get(item.type) || 0) + 1);
+  const breakdown = [...TRACE_LABELS].filter(([type]) => counts.has(type)).map(([type, label]) =>
+    `<span class="trace-pill">${esc(label)} ${counts.get(type)}</span>`).join('');
+  return `<details class="trace-group" id="group-${esc(key)}" data-trace-group="${esc(key)}" data-trace-end="${esc(endKey)}" ${isOpen ? 'open' : ''}>
+    <summary id="group-head-${esc(key)}">
+      <span class="trace-caret" aria-hidden="true"></span>
+      <span class="trace-group-title">过程记录 · ${items.length} 项</span>
+      <span class="trace-breakdown">${breakdown}</span>
+      <span class="trace-time">${esc(clockTime(latest.createdAtMs))}</span>
+    </summary>
+    <div class="trace-group-body">${items.map(item => renderTraceRow(item, threadId)).join('')}</div>
+  </details>`;
+}
+
 function renderHistory(detail, task) {
   const msgs = detail?.messages || [];
   if (!msgs.length) return `<div class="detail-empty">暂无记录</div>`;
   const ordered = state.historyNewestFirst ? [...msgs].reverse() : msgs;
   const canSend = Boolean(state.capabilities?.message);
   const latestMessage = msgs.findLast(m => !TRACE_LABELS.has(m.type));
-
-  return `<div class="feed-inner">${ordered
-    .map((m) => {
-      const isLatest = m === latestMessage;
-      const kind = TRACE_LABELS.get(m.type);
-      if (kind) {
-        const firstLine = oneLineClean(m.text.split('\n')[0]).slice(0, 130);
-        return `
-          <details class="trace-row">
-            <summary>
-              <span class="trace-kind">${kind}</span>
-              <span class="trace-line">${esc(firstLine)}</span>
-              <span class="trace-time">${esc(clockTime(m.createdAtMs))}</span>
-            </summary>
-            <div class="trace-body">${esc(m.text)}</div>
-          </details>`;
+  const entries = [];
+  for (let i = 0; i < ordered.length; i++) {
+    const m = ordered[i];
+    if (TRACE_LABELS.has(m.type)) {
+      if (state.uiPrefs.traceDisplayMode === 'expanded') {
+        entries.push(renderTraceRow(m, task.id));
+      } else {
+        const start = i;
+        while (i + 1 < ordered.length && TRACE_LABELS.has(ordered[i + 1].type)) i++;
+        const previous = ordered[start - 1];
+        const next = ordered[i + 1];
+        entries.push(renderTraceGroup(ordered.slice(start, i + 1), task.id,
+          state.historyNewestFirst ? next : previous, state.historyNewestFirst ? previous : next));
       }
-
-      const isUser = m.type === 'userMessage';
-      const role = isUser ? '主控' : m.type === 'plan' ? '计划' : 'Codex';
-      return `
-        <article class="msg-card ${isUser ? 'user' : ''} ${isLatest ? 'latest' : ''}">
-          <div class="msg-head">
-            <span class="msg-role">${isLatest ? '<span class="latest-dot"></span>' : ''}${esc(role)}</span>
-            <div style="display:flex;align-items:center;gap:6px">
-              <span>${esc(clockTime(m.createdAtMs))}</span>
-              ${canSend && !isUser ? `<button class="text-btn violet" data-send-back="${esc(`【${task.title} (${task.shortId})】\n${m.text}`)}">发回对话</button>` : ''}
-            </div>
+      continue;
+    }
+    const isLatest = m === latestMessage;
+    const isUser = m.type === 'userMessage';
+    const role = isUser ? '主控' : m.type === 'plan' ? '计划' : 'Codex';
+    entries.push(`
+      <article class="msg-card ${isUser ? 'user' : ''} ${isLatest ? 'latest' : ''}" id="message-${esc(historyKey(task.id, m))}">
+        <div class="msg-head">
+          <span class="msg-role">${isLatest ? '<span class="latest-dot"></span>' : ''}${esc(role)}</span>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span>${esc(clockTime(m.createdAtMs))}</span>
+            ${canSend && !isUser ? `<button class="text-btn violet" data-send-back="${esc(`【${task.title} (${task.shortId})】\n${m.text}`)}">发回对话</button>` : ''}
           </div>
-          <div class="msg-body">${isUser ? esc(m.text) : renderMd(m.text)}</div>
-        </article>`;
-    })
-    .join('')}</div>`;
+        </div>
+        <div class="msg-body">${isUser ? esc(m.text) : renderMd(m.text)}</div>
+      </article>`);
+  }
+  return `<div class="feed-inner" data-history-order="${state.historyNewestFirst}">${entries.join('')}</div>`;
 }
 
 function renderOps(detail, task) {
@@ -829,8 +901,8 @@ function renderGit(git) {
 function renderTaskDetailPane() {
   const task = selectedTask();
   if (!task) return `<main class="detail-pane"><div class="detail-empty">选择一个任务</div></main>`;
-  const detail = state.selectedDetail;
-  const git = state.selectedGit;
+  const detail = state.selectedDetail?.task?.id === task.id ? state.selectedDetail : null;
+  const git = detail?.git;
   const metaParts = [
     task.projectName,
     task.branch,
@@ -866,9 +938,14 @@ function renderTaskDetailPane() {
           <button class="sub-tab-btn ${state.detailSubTab === 'ops' ? 'active' : ''}" data-subtab="ops">诊断${detail?.ops?.length ? ` (${detail.ops.length})` : ''}</button>
           <button class="sub-tab-btn ${state.detailSubTab === 'git' ? 'active' : ''}" data-subtab="git">变更${git?.files?.length ? ` (${git.files.length})` : ''}</button>
         </div>
-        ${state.detailSubTab === 'history' ? `<button class="text-btn tip-trigger tip-bottom-right" id="btnToggleHistoryOrder" data-tip="切换动态时间顺序">${state.historyNewestFirst ? '↓ 最新' : '↑ 正序'}</button>` : ''}
+        ${state.detailSubTab === 'history' ? `<div class="sub-nav-actions">
+          <button type="button" class="text-btn tip-trigger tip-bottom-right tip-wrap" id="btnToggleTraceMode"
+            data-tip="切换过程记录的分组收拢与逐条平铺，同步到设置" ${state.savingPrefs ? 'disabled' : ''}>过程: ${state.uiPrefs.traceDisplayMode === 'grouped' ? '收拢' : '展开'}</button>
+          <button type="button" class="text-btn tip-trigger tip-bottom-right" id="btnToggleHistoryOrder" data-tip="切换动态时间顺序">${state.historyNewestFirst ? '↓ 最新' : '↑ 正序'}</button>
+        </div>` : ''}
       </div>
 
+      ${state.detailSubTab === 'history' && state.uiPrefs.progressCardEnabled && detail?.progress ? renderProgressCard(detail.progress, task.id) : ''}
       <div class="detail-scroll">
         ${state.detailSubTab === 'history' ? renderHistory(detail, task) : ''}
         ${state.detailSubTab === 'ops' ? renderOps(detail, task) : ''}
@@ -1017,15 +1094,15 @@ function renderCollabDetailPane() {
 }
 
 function renderSettingsWorkspace() {
-  const { uiStyle, catEnabled, catLinkTaskStatus } = state.uiPrefs;
+  const { uiStyle, catEnabled, catLinkTaskStatus, progressCardEnabled, traceDisplayMode } = state.uiPrefs;
   const env = state.codexEnv;
   const modelSource = env && !env.models?.length ? '（默认）' : '';
   const disabled = state.savingPrefs ? 'disabled' : '';
-  const option = (style, label) => `
-    <button type="button" class="style-option" data-style-option="${style}"
-      aria-pressed="${uiStyle === style}" ${disabled}>
-      <span aria-hidden="true" class="style-swatch swatch-${style}"><i></i><i></i></span>
-      ${label}
+  const option = (attribute, value, label, selected) => `
+    <button type="button" class="style-option" ${attribute}="${esc(value)}"
+      aria-pressed="${selected === value}" ${disabled}>
+      <span aria-hidden="true" class="style-swatch swatch-${esc(value)}"><i></i><i></i></span>
+      ${esc(label)}
     </button>`;
   return `
     <main class="settings-scroll" aria-label="设置">
@@ -1047,9 +1124,21 @@ function renderSettingsWorkspace() {
         <section class="settings-card">
           <h2>界面风格</h2>
           <div class="style-options">
-            ${option('minimal', '极简清爽（默认）')}
-            ${option('glow', '紫光流光卡片')}
+            ${option('data-style-option', 'minimal', '极简清爽（默认）', uiStyle)}
+            ${option('data-style-option', 'glow', '紫光流光卡片', uiStyle)}
           </div>
+        </section>
+        <section class="settings-card">
+          <h2>动态显示</h2>
+          <label class="setting-toggle">
+            顶部悬浮进度卡
+            <input type="checkbox" role="switch" id="progressCardEnabled" ${progressCardEnabled ? 'checked' : ''} ${disabled}>
+          </label>
+          <div class="style-options">
+            ${option('data-trace-mode', 'grouped', '过程按段收拢（默认）', traceDisplayMode)}
+            ${option('data-trace-mode', 'expanded', '过程直接平铺', traceDisplayMode)}
+          </div>
+          <p class="settings-hint">思考、命令、工具调用与文件改动可按段收拢或直接平铺，也能在任务「动态」页顶栏随时切换并点击展开。</p>
         </section>
         <section class="settings-card">
           <h2>顶部像素小猫</h2>
@@ -1063,8 +1152,10 @@ function renderSettingsWorkspace() {
               ${catLinkTaskStatus ? 'checked' : ''} ${!catEnabled || state.savingPrefs ? 'disabled' : ''}>
           </label>
           <p class="settings-hint" id="catLinkHint">默认关闭，作为纯互动解压小猫（左右跑动、点击跳起、连点开心或生气颤动）；开启后自动关联任务运行、阻塞与休眠状态。</p>
-          <button type="button" class="text-btn reset-prefs" id="btnResetPrefs" ${disabled}>恢复默认选项</button>
         </section>
+        <div class="settings-foot">
+          <button type="button" class="text-btn" id="btnResetPrefs" ${disabled}>恢复默认选项</button>
+        </div>
       </div>
     </main>`;
 }
@@ -1220,6 +1311,26 @@ function reactToCatClick(event) {
   }
 }
 
+function rememberTrace(el) {
+  const { traceRow, traceGroup, traceEnd } = el.dataset;
+  const open = traceRow ? state.openTraceRows : state.openTraceGroups;
+  for (const key of [traceRow, traceGroup, traceEnd]) {
+    if (!key) continue;
+    if (el.open) open.add(key);
+    else open.delete(key);
+  }
+}
+
+function historyAnchor(feed) {
+  const scroll = feed?.parentElement;
+  if (!scroll?.scrollTop || feed.dataset.historyOrder !== String(state.historyNewestFirst)) return null;
+  const top = scroll.getBoundingClientRect().top;
+  const entry = Array.from(feed.children).find(el => el.getBoundingClientRect().bottom > top);
+  const row = entry?.open && Array.from(entry.querySelectorAll('[data-trace-row]')).find(el => el.getBoundingClientRect().bottom > top);
+  const anchor = row || entry;
+  return anchor && { id: anchor.id, offset: anchor.getBoundingClientRect().top - top };
+}
+
 function render() {
   const root = document.getElementById('root');
   if (!root) return;
@@ -1241,8 +1352,12 @@ function render() {
   const activeId = activeEl?.id;
   const selStart = activeEl?.selectionStart;
   const selEnd = activeEl?.selectionEnd;
-  const scrollSelectors = ['.task-list', '.detail-scroll', '.hidden-drawer-body', '.settings-scroll'];
+  const scrollSelectors = ['.task-list', '.detail-scroll', '.progress-steps', '.hidden-drawer-body', '.settings-scroll'];
   const scrollPositions = scrollSelectors.map((selector) => root.querySelector(selector)?.scrollTop || 0);
+  const feed = root.querySelector('[data-history-order]');
+  // A poll can replace the workspace before the browser delivers its queued toggle event.
+  feed?.querySelectorAll('details').forEach(rememberTrace);
+  const anchor = historyAnchor(feed);
 
   document.documentElement.dataset.uiStyle = state.uiPrefs.uiStyle;
   root.querySelector('.app-shell').dataset.uiStyle = state.uiPrefs.uiStyle;
@@ -1283,6 +1398,11 @@ function render() {
     const el = root.querySelector(selector);
     if (el) el.scrollTop = scrollPositions[i];
   });
+  const anchored = anchor && document.getElementById(anchor.id);
+  if (anchored?.getClientRects().length) {
+    const scroll = anchored.closest('.detail-scroll');
+    scroll.scrollTop += anchored.getBoundingClientRect().top - scroll.getBoundingClientRect().top - anchor.offset;
+  }
   if (activeId && !activeEl.isConnected) {
     const el = document.getElementById(activeId);
     el?.focus({ preventScroll: true });
@@ -1300,6 +1420,12 @@ function bindEvents() {
   document.getElementById('btnDetect')?.addEventListener('click', () => refreshSnapshot());
   document.querySelectorAll('[data-style-option]').forEach((el) =>
     el.addEventListener('click', () => saveUiPrefs({ uiStyle: el.dataset.styleOption }))
+  );
+  document.querySelectorAll('[data-trace-mode]').forEach(el =>
+    el.addEventListener('click', () => saveUiPrefs({ traceDisplayMode: el.dataset.traceMode }))
+  );
+  document.getElementById('progressCardEnabled')?.addEventListener('change', e =>
+    saveUiPrefs({ progressCardEnabled: e.target.checked })
   );
   document.getElementById('catEnabled')?.addEventListener('change', (e) =>
     saveUiPrefs({ catEnabled: e.target.checked })
@@ -1355,6 +1481,16 @@ function bindEvents() {
     const sc = document.querySelector('.detail-scroll');
     if (sc) sc.scrollTop = 0;
   });
+  document.getElementById('btnToggleTraceMode')?.addEventListener('click', () => {
+    saveUiPrefs({ traceDisplayMode: state.uiPrefs.traceDisplayMode === 'grouped' ? 'expanded' : 'grouped' });
+  });
+  document.getElementById('btnToggleProgress')?.addEventListener('click', e => {
+    state.progressExpandedByThread.set(state.selectedThreadId, e.currentTarget.getAttribute('aria-expanded') !== 'true');
+    render();
+  });
+  document.querySelector('[data-history-order]')?.addEventListener('toggle', e => {
+    if (e.target.isConnected) rememberTrace(e.target);
+  }, true);
 
   document.querySelectorAll('[data-select-thread]').forEach((el) =>
     el.addEventListener('click', () => loadThreadDetail(el.dataset.selectThread))
@@ -1581,6 +1717,7 @@ app.onhostcontextchanged = (ctx) => {
 
 async function boot() {
   await app.connect();
+  window.matchMedia('(max-width: 640px)').addEventListener('change', render);
   state.capabilities = app.getHostCapabilities() || {};
   const ctx = app.getHostContext();
   if (ctx?.theme) {

@@ -3,11 +3,18 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const DEFAULT_UI_PREFS = Object.freeze({ uiStyle: 'minimal', catEnabled: true, catLinkTaskStatus: false });
+const DEFAULT_UI_PREFS = Object.freeze({
+  uiStyle: 'minimal',
+  catEnabled: true,
+  catLinkTaskStatus: false,
+  progressCardEnabled: true,
+  traceDisplayMode: 'grouped',
+});
 
 function validUiPref(key, value) {
   if (key === 'uiStyle') return value === 'minimal' || value === 'glow';
-  return (key === 'catEnabled' || key === 'catLinkTaskStatus') && typeof value === 'boolean';
+  if (key === 'traceDisplayMode') return value === 'grouped' || value === 'expanded';
+  return ['catEnabled', 'catLinkTaskStatus', 'progressCardEnabled'].includes(key) && typeof value === 'boolean';
 }
 
 export class ConsoleDB {

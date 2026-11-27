@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { buildThreadProgress, unwrapStructuredReply } from './progress-summary.mjs';
 
 function stateDir(configured, defaultDir) {
   const value = configured || defaultDir;
@@ -82,22 +83,6 @@ function dispatchMessages(record, task) {
   if (!messages.length) append(task.id, 'userMessage', record?.prompt, task.createdAtMs);
   if (!messages.some(m => m.type === 'agentMessage')) append(task.id, 'agentMessage', task.summary, task.updatedAtMs);
   return messages;
-}
-
-function unwrapStructuredReply(rawText) {
-  const trimmed = (rawText || '').trim();
-  if (!trimmed) return '';
-  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-    try {
-      const obj = JSON.parse(trimmed);
-      if (obj && typeof obj.summary === 'string' && obj.summary.trim()) {
-        return obj.summary.trim();
-      }
-    } catch {
-      // fall through
-    }
-  }
-  return trimmed;
 }
 
 function parseWorktreeLabel(cwd) {
@@ -181,41 +166,98 @@ function deriveProjectName(row, projectsById, projectRoots, dispatchTask) {
   return cwd || '未分类项目';
 }
 
+function parseItemJson(value) {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+function formatToolCall(obj) {
+  const args = parseItemJson(obj.arguments) ?? obj.arguments;
+  const preview = args?.url || args?.path || args?.file_path || args?.query || args?.target?.url || args?.target?.path;
+  const name = [obj.server, obj.tool].filter(Boolean).join('.') || '工具调用';
+  const first = name + (typeof preview === 'string' ? ' ' + preview.replace(/\s+/g, ' ').slice(0, 100) : '') +
+    (obj.status ? ` [${obj.status}]` : '');
+  const lines = [first];
+  if (args != null) lines.push('参数 ' + (typeof args === 'string' ? args : JSON.stringify(args)).slice(0, 800));
+  const result = obj.result;
+  const resultText = typeof result === 'string' ? result : result?.text ||
+    (Array.isArray(result?.content) && result.content.map(part => part?.text).filter(Boolean).join('\n'));
+  if (typeof resultText === 'string' && resultText.trim()) lines.push('结果 ' + resultText.trim().slice(0, 1200));
+  if (obj.error?.message) lines.push('错误 ' + String(obj.error.message).slice(0, 400));
+  return lines.join('\n');
+}
+
+function formatWebSearch(obj) {
+  const query = obj.query || obj.action?.query || obj.action?.queries?.[0];
+  const results = obj.results ?? obj.action?.results;
+  const count = obj.resultCount ?? (Array.isArray(results) ? results.length : null);
+  const lines = [((typeof query === 'string' ? query.trim() : query?.query) || '网页搜索') +
+    (Number.isInteger(count) ? ` · ${count} 条结果` : '')];
+  for (const result of (Array.isArray(results) ? results : []).slice(0, 3)) {
+    if (!result) continue;
+    let domain = result.domain;
+    try { domain ||= new URL(result.url).hostname; } catch { /* Some results only have a title. */ }
+    const line = [result.title, domain].filter(Boolean).join(' · ');
+    if (line) lines.push(line);
+  }
+  return lines.join('\n');
+}
+
 function extractTextFromItem(itemType, itemJson) {
-  if (!itemJson) return '';
-  try {
-    const obj = JSON.parse(itemJson);
-    if (itemType === 'agentMessage' || itemType === 'plan') {
-      return typeof obj.text === 'string' ? obj.text : '';
+  const obj = parseItemJson(itemJson);
+  if (!obj) return '';
+  if (itemType === 'mcpToolCall') return formatToolCall(obj);
+  if (itemType === 'webSearch') return formatWebSearch(obj);
+  if (itemType === 'agentMessage' || itemType === 'plan') {
+    return typeof obj.text === 'string' ? obj.text : '';
+  }
+  if (itemType === 'userMessage') {
+    if (Array.isArray(obj.content)) {
+      return obj.content
+        .filter((c) => c && (c.type === 'text' || typeof c.text === 'string'))
+        .map((c) => c.text || '')
+        .join('\n');
     }
-    if (itemType === 'userMessage') {
-      if (Array.isArray(obj.content)) {
-        return obj.content
-          .filter((c) => c && (c.type === 'text' || typeof c.text === 'string'))
-          .map((c) => c.text || '')
-          .join('\n');
-      }
-      return typeof obj.text === 'string' ? obj.text : '';
+    return typeof obj.text === 'string' ? obj.text : '';
+  }
+  if (itemType === 'commandExecution') {
+    return `$ ${obj.command || ''}${obj.status ? ` [${obj.status}]` : ''}`;
+  }
+  if (itemType === 'fileChange') {
+    const files = Array.isArray(obj.changes)
+      ? obj.changes.filter(c => c?.path).map(c => `${c.kind?.type || (typeof c.kind === 'string' ? c.kind : 'edit')}: ${c.path}`)
+      : [];
+    return files.join('\n');
+  }
+  if (itemType === 'reasoning') {
+    if (Array.isArray(obj.summary) && obj.summary.length) {
+      return obj.summary.map(part => typeof part === 'string' ? part : part?.text).filter(Boolean).join(' / ');
     }
-    if (itemType === 'commandExecution') {
-      return `$ ${obj.command || ''}${obj.status ? ` [${obj.status}]` : ''}`;
-    }
-    if (itemType === 'fileChange') {
-      const files = Array.isArray(obj.changes)
-        ? obj.changes.map((c) => `${c.kind?.type || 'edit'}: ${c.path || ''}`)
-        : [];
-      return files.join('\n');
-    }
-    if (itemType === 'reasoning') {
-      if (Array.isArray(obj.summary) && obj.summary.length) {
-        return obj.summary.join(' / ');
-      }
-      return '';
-    }
-  } catch {
     return '';
   }
   return '';
+}
+
+function historyMessage(row) {
+  const obj = parseItemJson(row.item_json);
+  const text = extractTextFromItem(row.item_type, obj);
+  const message = { id: row.item_id, turnId: row.turn_id, ordinal: row.rollout_ordinal,
+    type: row.item_type, createdAtMs: row.created_at_ms, text };
+  if (row.item_type === 'agentMessage') {
+    message.text = unwrapStructuredReply(text);
+    message.phase = obj?.phase ?? null;
+  }
+  return message;
+}
+
+function readSubAgentItems(db, threadId) {
+  return db.prepare(`
+    SELECT item_json, rollout_ordinal, created_at_ms FROM thread_items
+    WHERE thread_id = ? AND item_type = 'subAgentActivity'
+    ORDER BY rollout_ordinal DESC LIMIT 40
+  `).all(threadId).map(row => ({
+    ...parseItemJson(row.item_json), ordinal: row.rollout_ordinal, createdAtMs: row.created_at_ms,
+  }));
 }
 
 function computeEffectiveStatus({ thread, goal, latestTurn, dispatchTask }) {
@@ -669,7 +711,9 @@ export class CodexStore {
     threadId = task.id;
     if (task.source === 'dispatch') {
       const record = readDispatchState(this.dispatchFile).tasks?.[task.dispatchTask.taskId];
-      return { task, turns: [], messages: dispatchMessages(record, task), queuedItems: [], childThreads: [],
+      const messages = dispatchMessages(record, task);
+      const subAgentItems = task.sessionId ? withReadOnlyDb(this.historyDbPath, db => readSubAgentItems(db, threadId), []) : [];
+      return { task, turns: [], messages, progress: buildThreadProgress({ task, items: messages, subAgentItems }), queuedItems: [], childThreads: [],
         ops: this.consoleDb.listOps({ threadId, limit: 25 }), bindings: this.consoleDb.listBindings({ threadId, limit: 20 }) };
     }
 
@@ -691,40 +735,37 @@ export class CodexStore {
             FROM thread_items
             WHERE thread_id = ?
               AND item_type IN ('userMessage', 'agentMessage', 'plan')
-            UNION
+            UNION ALL
             SELECT turn_id, item_id, rollout_ordinal, created_at_ms, item_type, item_json
             FROM (
               SELECT turn_id, item_id, rollout_ordinal, created_at_ms, item_type, item_json
               FROM thread_items
               WHERE thread_id = ?
-                AND item_type IN ('fileChange', 'commandExecution', 'reasoning')
+                AND item_type IN ('fileChange', 'commandExecution', 'reasoning', 'mcpToolCall', 'webSearch')
               ORDER BY rollout_ordinal DESC
-              LIMIT 80
+              LIMIT 120
             )
           )
           ORDER BY rollout_ordinal DESC
-          LIMIT 110
+          LIMIT 160
         `).all(threadId, threadId);
 
-        const messages = items
-          .reverse()
-          .map((it) => {
-            const rawText = extractTextFromItem(it.item_type, it.item_json);
-            const text = it.item_type === 'agentMessage' ? unwrapStructuredReply(rawText) : rawText;
-            return {
-              id: it.item_id,
-              turnId: it.turn_id,
-              ordinal: it.rollout_ordinal,
-              type: it.item_type,
-              createdAtMs: it.created_at_ms,
-              text: text.length > 4000 ? `${text.slice(0, 4000)}\n…(已截断)` : text,
-            };
-          })
-          .filter((m) => m.text && m.text.trim());
+        const messages = items.reverse().map(historyMessage).filter(m => m.text.trim());
+        let progressItems = messages;
+        // Keep the latest explicit plan authoritative even after it scrolls
+        // out of the bounded feed. Long plan bodies are parsed before clipping.
+        if (items.length === 160 && !messages.some(m => m.type === 'plan')) {
+          const plan = db.prepare(`
+            SELECT turn_id, item_id, rollout_ordinal, created_at_ms, item_type, item_json
+            FROM thread_items WHERE thread_id = ? AND item_type = 'plan'
+            ORDER BY rollout_ordinal DESC LIMIT 1
+          `).get(threadId);
+          if (plan) progressItems = [historyMessage(plan), ...messages];
+        }
 
-        return { turns, messages };
+        return { turns, messages, progressItems, subAgentItems: readSubAgentItems(db, threadId) };
       },
-      { turns: [], messages: [] }
+      { turns: [], messages: [], progressItems: [], subAgentItems: [] }
     );
 
     const queuedItems = withReadOnlyDb(
@@ -756,7 +797,8 @@ export class CodexStore {
     return {
       task,
       turns: history.turns,
-      messages: history.messages,
+      messages: history.messages.map(m => m.text.length > 4000 ? { ...m, text: m.text.slice(0, 4000) + '\n…(已截断)' } : m),
+      progress: buildThreadProgress({ task, items: history.progressItems, subAgentItems: history.subAgentItems, turns: history.turns }),
       queuedItems,
       childThreads,
       ops,

@@ -6,11 +6,81 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
+import { buildThreadProgress, summarizeEnglishToChinese } from '../plugins/codex-console/server/progress-summary.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
 const LAUNCHER = path.join(ROOT, 'plugins', 'codex-console', 'bin', 'run-server.sh');
+
+function testProgressRules() {
+  const progress = (code, items = [], extra = {}) => buildThreadProgress({ task: { status: { code } }, items, ...extra });
+  for (const [code, label] of Object.entries({
+    running: '执行中', goal_active: '执行中', blocked: '已阻塞', limited: '额度受限', failed: '执行异常',
+    paused: '已暂停', exec_done: '已完成', complete: '已完成', completed: '已完成', archived: '已归档', idle: '已就绪',
+  })) assert.equal(progress(code).statusLabel, label);
+
+  const plan = { type: 'plan', turnId: 'plan-turn', ordinal: 2, text: '## 1. 核对记录\n说明\n### Step 2: 调整界面\n3. 验证结果' };
+  const updates = ['已核对记录。', '正在调整界面。'].map((text, i) => ({
+    type: 'agentMessage', phase: 'commentary', text, ordinal: i + 3,
+  }));
+  const statuses = p => p.steps.map(step => step.status);
+  assert.deepEqual(statuses(progress('complete', [plan])), ['done', 'done', 'done']);
+  assert.deepEqual(statuses(progress('running', [plan])), ['in_progress', 'pending', 'pending']);
+  assert.deepEqual(statuses(progress('failed', [...updates, plan])), ['done', 'failed', 'pending']);
+  const turns = [{ turn_id: 'plan-turn', status: 'completed' }, { turn_id: 'earlier-turn', status: 'completed' }];
+  assert.deepEqual(statuses(progress('blocked', [plan], { turns })), ['done', 'pending', 'pending']);
+  assert.deepEqual(statuses(progress('goal_active', [plan, ...updates], { turns })), ['done', 'in_progress', 'pending']);
+  const earlier = { ...plan, ordinal: 1, text: '- [x] 旧步骤\n- [x] 第二项' };
+  assert.deepEqual(progress('running', [plan, earlier, ...updates]).steps.map(s => s.title), ['核对记录', '调整界面', '验证结果']);
+  const list = progress('running', [{ type: 'userMessage', text: '请按以下步骤执行\n1. 读取记录\n2. 核对差异' }]);
+  assert.equal(list.source, 'plan');
+  assert.deepEqual(statuses(list), ['in_progress', 'pending']);
+  const boxed = { type: 'plan', text: '- [ ] 先核对\n- [x] 已记录\n- [ ] 后验证' };
+  assert.deepEqual(statuses(progress('running', [boxed])), ['in_progress', 'done', 'pending']);
+  assert.deepEqual(statuses(progress('completed', [boxed])), ['pending', 'done', 'pending']);
+  assert.equal(progress('running', [{ type: 'plan', text: Array.from({ length: 12 }, (_, i) => `${i + 1}. 步骤 ${i + 1}`).join('\n') }]).totalSteps, 8);
+  const codeExample = { type: 'userMessage', text: '示例\n```md\n1. 样例甲\n2. 样例乙\n```' };
+  assert.deepEqual(progress('running', [codeExample]).steps, []);
+  const ordinaryList = { type: 'agentMessage', text: '常见水果有\n1. 苹果\n2. 香蕉\n3. 橙子' };
+  assert.deepEqual(progress('idle', [ordinaryList]).steps, []);
+
+  assert.deepEqual(statuses(progress('failed', updates)), ['done', 'failed']);
+  assert.deepEqual(statuses(progress('exec_done', updates)), ['done', 'done']);
+  assert.deepEqual(progress('running', [updates[0], updates[0], { type: 'agentMessage', text: 'OK' }]).steps, []);
+  const many = Array.from({ length: 9 }, (_, i) => ({ type: 'agentMessage', text: `核对第 ${i} 项记录。` }));
+  assert.deepEqual(progress('running', many).steps.map(s => s.title), many.slice(-6).map(m => m.text.slice(0, -1)));
+
+  for (const [raw, expected] of [
+    ['**Rerunning updated build tests**', '正在重新运行构建与测试'],
+    ['Now read runner.mjs and index.mjs', '正在查看 runner.mjs 和 index.mjs'],
+    ['**Checking fallback and UI prefs**', '正在检查回退逻辑与界面偏好'],
+    ['Code review completed. Updated main.js and styles.css. 18 tests passed.', '已完成代码审查，涉及 main.js 和 styles.css，18 项测试已通过'],
+    ['Failed to update preferences.', '修改界面偏好失败'],
+    ['No tests passed.', '没有测试通过'],
+  ]) assert.equal(summarizeEnglishToChinese(raw), expected);
+  assert.doesNotMatch(summarizeEnglishToChinese('Checking whether the tests passed.'), /已通过/);
+  const cn = { type: 'agentMessage', text: JSON.stringify({ summary: '**已核对** [记录](local.md) 与 `main.js`。继续处理下一项。' }) };
+  assert.equal(progress('running', [cn]).summary, '已核对 记录 与 main.js。');
+  const trace = { type: 'reasoning', text: '**Checking fallback and UI prefs**', ordinal: 5, createdAtMs: 100 };
+  const live = progress('running', [trace]);
+  assert.equal(live.currentAction, '正在检查回退逻辑与界面偏好');
+  assert.equal(live.summary, live.currentAction);
+  assert.equal(live.updatedAtMs, 100);
+  assert.equal(progress('paused', [trace]).currentAction, null);
+  assert.equal(progress('running', [trace, { ...cn, ordinal: 6 }]).currentAction, null);
+  assert.equal(progress('running', [trace, { type: 'userMessage', ordinal: 6, text: '继续' }]).currentAction, null);
+  assert.equal(progress('running', [{ type: 'commandExecution', text: '$ npm run build && npm test [completed]' }]).currentAction, '正在运行构建与测试');
+  const long = progress('running', [{ type: 'agentMessage', text: '正在核对记录'.repeat(50) }, ...updates]);
+  assert.ok(long.steps.every(s => s.title.length <= 34));
+  assert.ok(progress('running', [{ ...cn, text: '正在核对记录'.repeat(50) }]).summary.length <= 96);
+}
+
+function insertHistory(db, threadId, ordinal, type, payload, createdAtMs = Date.now()) {
+  db.prepare('INSERT INTO thread_items VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+    threadId, 'turn-1', `item-${ordinal}`, ordinal, createdAtMs, type, JSON.stringify(payload),
+  );
+}
 
 function createSyntheticCodexHome(codexHome, dispatchDir) {
   fs.mkdirSync(codexHome, { recursive: true });
@@ -144,9 +214,27 @@ function createSyntheticCodexHome(codexHome, dispatchDir) {
     .run(
       nowMs - 5000,
       JSON.stringify({
+        phase: 'final',
         text: JSON.stringify({ status: 'completed', summary: 'Implemented JWT auth with 18 passing tests.' }),
       })
     );
+  const english = '01a90000-0000-7000-8000-000000000001';
+  const chinese = '01a90000-0000-7000-8000-000000000002';
+  const simple = '01a90000-0000-7000-8000-000000000003';
+  const traces = [
+    ['reasoning', { summary: ['**Checking fallback and UI prefs**'] }],
+    ['commandExecution', { command: 'npm test', status: 'completed' }],
+    ['mcpToolCall', { server: 'codex', tool: 'open_in_codex', arguments: { path: 'ui/main.js' },
+      status: 'completed', result: { content: [{ type: 'text', text: 'Opened file' }] } }],
+    ['webSearch', { action: { queries: ['UI preferences', 'unused query'] },
+      results: ['First', 'Second', 'Third', 'Fourth'].map(title => ({ title, url: `https://example.org/${title}` })) }],
+    ['fileChange', { changes: [{ path: 'ui/main.js', kind: { type: 'update' } }, { path: 'ui/styles.css' }] }],
+  ];
+  traces.forEach(([type, payload], i) => insertHistory(histDb, english, 3 + i, type, payload, nowMs - 4000 + i));
+  ['**已读完现有记录**。', '已接入进度摘要。', '已核对动态页的设置。等待确认。'].forEach((text, i) =>
+    insertHistory(histDb, chinese, i + 1, 'agentMessage', { text, phase: 'commentary' }, nowMs - 3000 + i));
+  insertHistory(histDb, simple, 1, 'userMessage', { text: '你好，今天的安排是什么？' });
+  insertHistory(histDb, simple, 2, 'agentMessage', { text: '今天安排了例会。' });
   histDb.close();
 
   // 5. Synthetic rollout JSONL with dual 5h (49% used -> 51% rem) + weekly (12% used -> 88% rem)
@@ -299,6 +387,7 @@ async function connect(env, pluginData) {
 }
 
 async function runTests() {
+  testProgressRules();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'alc-test-'));
   const codexHome = path.join(tmp, 'codex-home');
   const dispatchDir = path.join(tmp, 'dispatch-state');
@@ -310,7 +399,7 @@ async function runTests() {
     ...process.env, CODEX_HOME: codexHome, CODEX_BIN: codexBin, AGY_MODELS_CACHE_FILE: '',
     AGY_DISPATCH_STATE_DIR: dispatchDir, AGY_DISPATCH_SCRIPT: script,
   };
-  const defaults = { uiStyle: 'minimal', catEnabled: true, catLinkTaskStatus: false };
+  const defaults = { uiStyle: 'minimal', catEnabled: true, catLinkTaskStatus: false, progressCardEnabled: true, traceDisplayMode: 'grouped' };
   let client;
   try {
     createSyntheticCodexHome(codexHome, dispatchDir);
@@ -379,7 +468,68 @@ print(json.dumps({"args": sys.argv[1:], "session_id": "fixture-session"}))
     const agent = snap.managedAgents.find(m => m.id === 'demo-task-1');
     assert.equal(agent.summary, 'Resume turn verified all 18 tests cleanly.');
     assert.equal(agent.changedFiles.length, 2);
-    assert.equal((await data('get_codex_task_detail', { threadId: task.id })).messages.length, 2);
+    const detail = threadId => data('get_codex_task_detail', { threadId });
+    assert.deepEqual(toolList.find(t => t.name === 'get_codex_task_detail')._meta.ui.visibility, ['model', 'app']);
+    const english = await detail(task.id);
+    assert.ok(english.git);
+    assert.deepEqual(english.messages.map(m => m.type), ['userMessage', 'agentMessage', 'reasoning', 'commandExecution', 'mcpToolCall', 'webSearch', 'fileChange']);
+    assert.equal(english.messages[1].phase, 'final');
+    assert.equal(english.messages[4].text, 'codex.open_in_codex ui/main.js [completed]\n参数 {"path":"ui/main.js"}\n结果 Opened file');
+    assert.equal(english.messages[5].text, 'UI preferences · 4 条结果\nFirst · example.org\nSecond · example.org\nThird · example.org');
+    assert.equal(english.progress.statusLabel, '执行中');
+    assert.deepEqual(english.progress.steps, []);
+    assert.equal(english.progress.summary, '已实现 JWT 认证，18 项测试已通过');
+    assert.equal(english.progress.currentAction, '正在修改 main.js 等 2 个文件');
+    const chinese = await detail(snap.tasks.find(t => t.status.code === 'blocked').id);
+    assert.ok(chinese.messages.every(m => m.phase === 'commentary'));
+    assert.equal(chinese.progress.source, 'commentary');
+    assert.equal(chinese.progress.statusLabel, '已阻塞');
+    assert.equal(chinese.progress.summary, '已核对动态页的设置。');
+    assert.deepEqual(chinese.progress.steps, [
+      { title: '已读完现有记录', status: 'done' }, { title: '已接入进度摘要', status: 'done' },
+      { title: '已核对动态页的设置', status: 'pending' },
+    ]);
+    assert.equal(chinese.progress.completedSteps, 2);
+    assert.equal(chinese.progress.totalSteps, 3);
+    const simple = await detail(cleaned.id);
+    assert.equal(simple.messages[1].phase, null);
+    assert.equal(simple.progress.source, 'summary');
+    assert.equal(simple.progress.summary, '今天安排了例会。');
+    assert.deepEqual(simple.progress.steps, []);
+
+    const history = new DatabaseSync(path.join(codexHome, 'thread_history_1.sqlite'));
+    try {
+      insertHistory(history, task.id, 8, 'plan', { text: '- [x] 核对现有实现\n- [ ] 接入进度摘要\n- [ ] 验证显示偏好' });
+      insertHistory(history, task.id, 9, 'agentMessage', { phase: 'commentary', text: '已经核对本地记录。' });
+      const planned = (await detail(task.id)).progress;
+      assert.equal(planned.source, 'plan');
+      assert.deepEqual(planned.steps, [
+        { title: '核对现有实现', status: 'done' }, { title: '接入进度摘要', status: 'in_progress' },
+        { title: '验证显示偏好', status: 'pending' },
+      ]);
+      assert.equal(planned.completedSteps, 1);
+      assert.equal(planned.currentAction, null);
+      const agents = [
+        { agentThreadId: 'agent-a', agentPath: '/root/a', kind: 'started' },
+        { agentPath: '/root/b', kind: 'started' },
+        { agentThreadId: 'agent-a', agentPath: '/root/a', kind: 'completed' },
+        { agentPath: '/root/b', kind: 'failed' },
+      ];
+      agents.forEach((payload, i) => insertHistory(history, cleaned.id, 3 + i, 'subAgentActivity', payload));
+      const subagents = (await detail(cleaned.id)).progress;
+      assert.equal(subagents.source, 'subagents');
+      assert.deepEqual(subagents.steps, [{ title: '/root/a', status: 'done' }, { title: '/root/b', status: 'failed' }]);
+      assert.equal(subagents.completedSteps, 1);
+      for (let i = 0; i < 45; i++) insertHistory(history, task.id, 10 + i, 'userMessage', { text: '继续' });
+      for (let i = 0; i < 125; i++) insertHistory(history, task.id, 55 + i, 'reasoning', { summary: ['Reading main.js'] });
+      const busy = await detail(task.id);
+      assert.equal(busy.messages.length, 160);
+      assert.equal(busy.messages.filter(m => m.type === 'reasoning').length, 120);
+      assert.ok(!busy.messages.some(m => m.type === 'plan'));
+      assert.deepEqual(busy.progress.steps, planned.steps);
+    } finally {
+      history.close();
+    }
     const ambiguous = await client.call('send_codex_message', { threadId: task.shortId, message: 'Continue' });
     assert.equal(ambiguous.isError, true);
     assert.match(ambiguous.content[0].text, /完整会话 ID/);
@@ -404,12 +554,14 @@ print(json.dumps({"args": sys.argv[1:], "session_id": "fixture-session"}))
     assert.equal(updated.pinned, false);
     await data('console_toggle_pin', { threadId: task.id, hidden: false });
 
-    const chosen = { uiStyle: 'glow', catEnabled: false, catLinkTaskStatus: true };
-    await prefs('save', { uiStyle: 'glow', catLinkTaskStatus: true });
+    const chosen = { uiStyle: 'glow', catEnabled: false, catLinkTaskStatus: true, progressCardEnabled: false, traceDisplayMode: 'expanded' };
+    await prefs('save', { uiStyle: 'glow', catLinkTaskStatus: true, progressCardEnabled: false, traceDisplayMode: 'expanded' });
     assert.deepEqual(await prefs('save', { catEnabled: false }), chosen);
-    for (const patch of [{ uiStyle: 'unknown' }, { uiStyle: 'minimal', catEnabled: 'true' }, { unknown: 'field' }]) {
+    for (const patch of [{ uiStyle: 'unknown' }, { uiStyle: 'minimal', catEnabled: 'true' }, { unknown: 'field' },
+      { traceDisplayMode: 'invalid', progressCardEnabled: true }, { progressCardEnabled: 'yes' }]) {
       assert.equal((await client.call('console_ui_prefs', { action: 'save', prefs: patch })).isError, true);
     }
+    assert.deepEqual(await prefs('get'), chosen);
     await client.close();
     client = await connect(env, pluginData);
     assert.deepEqual((await snapshot()).uiPrefs, chosen);
@@ -420,6 +572,8 @@ print(json.dumps({"args": sys.argv[1:], "session_id": "fixture-session"}))
       const insert = db.prepare('INSERT INTO ui_prefs VALUES (?, ?, ?)');
       insert.run('uiStyle', 'unknown', Date.now());
       insert.run('catEnabled', '0', Date.now());
+      insert.run('traceDisplayMode', 'invalid', Date.now());
+      insert.run('progressCardEnabled', 'yes', Date.now());
       insert.run('obsolete', 'true', Date.now());
       assert.deepEqual(await prefs('get'), defaults);
       assert.deepEqual(await prefs('reset'), defaults);
@@ -484,10 +638,16 @@ print(json.dumps({"args": sys.argv[1:], "session_id": "fixture-session"}))
     assert.equal(dispatchOnly.connected, false);
     assert.ok(dispatchOnly.tasks.some(t => t.id === 'pending'));
     assert.ok(!dispatchOnly.tasks.some(t => t.id === 'foreign'));
+    const synthetic = await detail(task.id);
+    assert.equal(synthetic.task.source, 'dispatch');
+    assert.deepEqual(synthetic.progress.steps, []);
+    assert.match(synthetic.progress.summary, /检查.*测试/);
+    assert.equal((await detail('pending')).progress.source, 'summary');
+    assert.equal((await detail(cleaned.id)).progress.source, 'subagents');
     const pendingAsk = await client.call('ask_codex_readonly', { threadId: 'pending', prompt: 'Status?' });
     assert.equal(pendingAsk.isError, true);
     assert.match(pendingAsk.content[0].text, /尚未关联 Codex 会话/);
-    console.log('[PASS] Codex MCP tools, model discovery, SQLite preferences, terminal states and execution arguments.');
+    console.log('[PASS] Codex MCP tools, progress and traces, model discovery, SQLite preferences, terminal states and execution arguments.');
   } finally {
     if (client) await client.close();
     fs.rmSync(tmp, { recursive: true, force: true });

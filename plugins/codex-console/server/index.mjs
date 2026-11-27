@@ -437,7 +437,7 @@ server.registerTool(
 server.registerTool(
   'console_ui_prefs',
   {
-    title: '控制台外观与像素小猫',
+    title: '控制台界面偏好',
     description: '读取、保存或恢复本地界面偏好。',
     inputSchema: {
       action: z.enum(['get', 'save', 'reset']).optional(),
@@ -445,6 +445,8 @@ server.registerTool(
         uiStyle: z.enum(['minimal', 'glow']).optional(),
         catEnabled: z.boolean().optional(),
         catLinkTaskStatus: z.boolean().optional(),
+        progressCardEnabled: z.boolean().optional(),
+        traceDisplayMode: z.enum(['grouped', 'expanded']).optional(),
       }).strict().optional(),
     },
     _meta: BOTH_META,
