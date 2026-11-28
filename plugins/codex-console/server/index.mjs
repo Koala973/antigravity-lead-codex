@@ -15,6 +15,9 @@ import { QuotaTracker } from './quota.mjs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
+const PLUGIN_VERSION = JSON.parse(
+  fs.readFileSync(path.join(PLUGIN_ROOT, 'package.json'), 'utf8')
+).version;
 
 function parseArgs(argv) {
   let dataDir = path.join(os.homedir(), '.local', 'state', 'codex-console');
@@ -38,6 +41,7 @@ const runner = new CodexRunner(consoleDb);
 const quotaTracker = new QuotaTracker({
   codexBin: runner.codexBin,
   env: buildExecEnv(),
+  clientVersion: PLUGIN_VERSION,
 });
 
 const APP_URI = 'ui://codex-console/app.html';
@@ -115,7 +119,7 @@ function ensureSession(task) {
 
 const server = new McpServer({
   name: 'codex-console',
-  version: '1.3.1',
+  version: PLUGIN_VERSION,
 });
 
 // UI Resource

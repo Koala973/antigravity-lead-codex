@@ -26,7 +26,7 @@ Options:
   --console-only    Install only the Antigravity Lead Codex side-pane MCP App plugin
   --uninstall       Remove installed Antigravity-Lead-Codex plugins and skill (keeps SQLite data)
   --ref <branch>    Git branch or tag to download when running remotely (default: main)
-  --no-build        Use pre-bundled dist/app.html without rebuilding UI via Vite
+  --no-build        Skip Vite UI rebuild by reusing prebuilt dist/app.html (still installs prod Node deps via npm ci --omit=dev; requires npm access)
   -y, --yes         Non-interactive mode
   -h, --help        Show this help message
 EOF
@@ -145,17 +145,22 @@ fi
 
 mkdir -p "$PLUGINS_DIR" "$SKILLS_DIR"
 
-# 1. Install codex-console plugin
+# 1. Install codex-console plugin (exclude dev node_modules from source checkout)
 log "Installing plugin: codex-console -> $PLUGINS_DIR/codex-console"
 mkdir -p "$PLUGINS_DIR/codex-console"
 rm -rf "$PLUGINS_DIR/codex-console"/{assets,bin,dist,server,ui,skills}
-cp -R "$SOURCE_DIR/plugins/codex-console"/* "$PLUGINS_DIR/codex-console/"
+for entry in "$SOURCE_DIR/plugins/codex-console"/*; do
+  base="$(basename "$entry")"
+  [[ "$base" == "node_modules" ]] && continue
+  cp -R "$entry" "$PLUGINS_DIR/codex-console/"
+done
 chmod +x "$PLUGINS_DIR/codex-console/bin/run-server.sh"
 
-log "Installing Node.js dependencies for codex-console..."
 if [[ "$SKIP_UI_BUILD" -eq 1 && -f "$PLUGINS_DIR/codex-console/dist/app.html" ]]; then
+  log "Installing production Node.js dependencies for codex-console (npm ci --omit=dev; reusing prebuilt dist/app.html)..."
   (cd "$PLUGINS_DIR/codex-console" && PATH="$(dirname "$NODE_BIN"):$PATH" "$NPM_BIN" ci --omit=dev --no-audit --no-fund)
 else
+  log "Installing Node.js dependencies and building codex-console UI..."
   (cd "$PLUGINS_DIR/codex-console" && PATH="$(dirname "$NODE_BIN"):$PATH" "$NPM_BIN" ci --no-audit --no-fund && "$NPM_BIN" run build:ui)
 fi
 ok "codex-console installed."

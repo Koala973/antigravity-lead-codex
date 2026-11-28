@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+plugins/codex-console/dist/app.html text eol=lf

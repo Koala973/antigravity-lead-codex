@@ -361,11 +361,14 @@ async function connect(env, pluginData) {
     });
   }
   try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'plugins', 'codex-console', 'package.json'), 'utf8'));
     const init = await rpc('initialize', {
-      protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'ci-test', version: '1.0.0' },
+      protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'ci-test', version: pkg.version },
     });
     assert.ok(init.capabilities.tools);
     assert.ok(init.capabilities.resources);
+    assert.equal(init.serverInfo?.name, 'codex-console');
+    assert.equal(init.serverInfo?.version, pkg.version);
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
   } catch (err) {
     child.kill();

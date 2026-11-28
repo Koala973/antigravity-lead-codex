@@ -2,6 +2,15 @@
 
 All notable changes to **antigravity-lead-codex** will be documented in this file.
 
+## [2.0.0] - Unreleased
+
+### Added / Changed (Wave 1: Engineering Hygiene, CI Activation & Single Version Source)
+- **Active GitHub Actions CI & Release Workflows**: Moved CI and Release workflows out of `docs/workflows/` into `.github/workflows/ci.yml` and `.github/workflows/release.yml` with explicit least-privilege `permissions`, `concurrency` cancellation, `timeout-minutes`, Node (`22`, `24`) × Python (`3.10`, `3.12`) matrix across `ubuntu-latest` and `macos-latest`, `dist/app.html` build-sync gating (`git diff --exit-code`), and end-to-end temp `GEMINI_CONFIG_DIR` install + `doctor.sh` + MCP stdio (`initialize` / `tools/list` / `resources/read`) verification.
+- **Release Pipeline & Honest Prebuilt UI Archive**: Updated `release.yml` and `scripts/package-release.sh` to run the full test suite before packaging, verify the unpacked release tarball via `install.sh --no-build` + `doctor.sh` + MCP stdio handshake before generating `SHA256SUMS.txt` and publishing, and clearly distinguish the prebuilt UI release archive (`npm ci --omit=dev` still fetches production dependencies) from an air-gapped offline bundle.
+- **Single Version Source (`2.0.0`) & Automated Consistency Guard**: Unified version metadata across `plugins/codex-console/package.json`, `package-lock.json`, `plugin.json`, `server/index.mjs`, `server/quota.mjs`, `ui/main.js`, `dist/app.html`, `plugins/codex-auto-router/plugin.json`, `README.md`, `README_EN.md`, and `CHANGELOG.md`, enforced by `scripts/check-version.mjs` in CI and release packaging.
+- **Open-Source Community Infrastructure**: Added `.github/ISSUE_TEMPLATE/bug_report.yml`, `.github/ISSUE_TEMPLATE/feature_request.yml`, `.github/PULL_REQUEST_TEMPLATE.md`, `CONTRIBUTING.md`, and `SECURITY.md`.
+- **Honest Codex-Only Backend & Hardened Privacy/Secret Scanner**: Removed the misleading public `VALID_BACKENDS = ("codex", "auto")` CLI abstraction in `skills/multi-agent-dispatch/scripts/dispatch.py` while preserving internal backward compatibility; upgraded `scripts/privacy-check.sh` to use `mktemp` + `trap` cleanup and added portable secret/token leak detection (`sk-`, `ghp_`, `AIza`, `AKIA`, Slack tokens, PEM private keys).
+
 ## [1.0.2] - 2026-11-25
 
 ### Added / 新增

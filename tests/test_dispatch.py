@@ -58,9 +58,15 @@ class DispatchAndHookTests(unittest.TestCase):
         return json.loads(output.getvalue())
 
     def test_codex_backend_defaults_and_alias(self):
+        self.assertEqual(self.dispatch.SUPPORTED_BACKEND, "codex")
+        self.assertFalse(hasattr(self.dispatch, "VALID_BACKENDS"))
         parser = self.dispatch.build_parser()
         for cmd, required in (("run", ["--prompt", "fix"]), ("batch", ["--manifest", "tasks.json"]),
                               ("resume", ["--prompt", "next"]), ("review", [])):
+            help_buf = io.StringIO()
+            with contextlib.redirect_stdout(help_buf), self.assertRaises(SystemExit):
+                parser.parse_args([cmd, "--help"])
+            self.assertNotIn("{codex,auto}", help_buf.getvalue())
             self.assertEqual(parser.parse_args([cmd, *required]).backend, "codex")
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parser.parse_args([cmd, *required, "--backend", "other-cli"])
