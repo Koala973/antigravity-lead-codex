@@ -9,7 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Koala973/antigravity-lead-codex/releases"><img src="https://img.shields.io/badge/release-v1.0.2-7c3aed.svg" alt="Release v1.0.2"/></a>
+  <a href="https://github.com/Koala973/antigravity-lead-codex/actions/workflows/ci.yml"><img src="https://github.com/Koala973/antigravity-lead-codex/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
+  <a href="https://github.com/Koala973/antigravity-lead-codex/releases"><img src="https://img.shields.io/badge/release-v2.0.0-7c3aed.svg" alt="Release v2.0.0"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"/></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20(WSL2)-lightgrey.svg" alt="Platform"/>
   <img src="https://img.shields.io/badge/node-%3E%3D22.5-339933.svg" alt="Node 22.5+"/>
@@ -100,14 +101,14 @@ Install **only** the `Codex Console` side-pane plugin:
 curl -fsSL https://raw.githubusercontent.com/Koala973/antigravity-lead-codex/main/scripts/install.sh | bash -s -- --console-only
 ```
 
-### Option 2: GitHub Release Archive
+### Option 2: GitHub Release Prebuilt UI Archive
 
-Download `antigravity-lead-codex-vX.Y.Z.tar.gz` and `SHA256SUMS.txt` from [Releases](https://github.com/Koala973/antigravity-lead-codex/releases):
+Download `antigravity-lead-codex-vX.Y.Z.tar.gz` and `SHA256SUMS.txt` from [Releases](https://github.com/Koala973/antigravity-lead-codex/releases). This archive ships a prebuilt `dist/app.html` so `--no-build` skips Vite and devDependencies, while still fetching the lightweight production Node dependencies (`@modelcontextprotocol/sdk`, `zod`) via `npm ci --omit=dev` (it is a prebuilt UI archive, not an air-gapped offline bundle):
 
 ```bash
 shasum -a 256 -c SHA256SUMS.txt
-tar -xzf antigravity-lead-codex-v1.0.0.tar.gz
-cd antigravity-lead-codex-v1.0.0
+tar -xzf antigravity-lead-codex-v2.0.0.tar.gz
+cd antigravity-lead-codex-v2.0.0
 bash scripts/install.sh --no-build
 ```
 
@@ -124,7 +125,7 @@ bash scripts/install.sh
 ## Usage & Diagnostics
 
 1. Open Antigravity → click **`+`** in the right auxiliary pane tab bar → select **`Codex Console`** (or open it full-page from the left sidebar).
-2. Run health diagnostics & MCP stdio smoke test anytime:
+2. Run health diagnostics & live MCP stdio handshake smoke test (`initialize` + `tools/list` + `resources/read`) anytime:
 
 ```bash
 bash scripts/doctor.sh

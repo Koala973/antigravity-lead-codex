@@ -46,7 +46,10 @@ FALLBACK_WIDE_FAST = "gpt-6.2-sol"
 
 VALID_DIFFICULTIES = ("auto", "low", "medium", "hard", "extreme")
 VALID_QUALITIES = ("smart", "max", "balanced")
-VALID_BACKENDS = ("codex", "auto")
+# This dispatcher exclusively targets OpenAI Codex CLI.
+SUPPORTED_BACKEND = "codex"
+# Internal backward-compatibility aliases accepted for legacy callers/manifests/state.
+_COMPAT_BACKENDS = (SUPPORTED_BACKEND, "auto")
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 MODEL_ID = re.compile(r"[A-Za-z0-9._/:@-]{1,160}")
 VALID_SANDBOXES = ("read-only", "workspace-write")
@@ -329,6 +332,19 @@ def validate_effort(value: str) -> str:
     if value not in VALID_EFFORTS:
         raise ValueError(f"Invalid reasoning effort: expected one of {', '.join(VALID_EFFORTS)}")
     return value
+
+
+def normalize_backend(value: str) -> str:
+    if value in _COMPAT_BACKENDS:
+        return SUPPORTED_BACKEND
+    raise ValueError(f"Unsupported backend: {value} (only '{SUPPORTED_BACKEND}' is supported)")
+
+
+def parse_backend_arg(value: str) -> str:
+    try:
+        return normalize_backend(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def selected_model(value: str | None) -> str | None:
@@ -941,9 +957,7 @@ def execute_single_task(
     if network and sandbox != "workspace-write":
         raise ValueError("--network requires --sandbox workspace-write.")
 
-    if backend not in VALID_BACKENDS:
-        raise ValueError(f"Unsupported backend: {backend}")
-    backend = "codex"
+    backend = normalize_backend(backend)
     if task_id and (Path(task_id).name != task_id or task_id in (".", "..")):
         raise ValueError("Task ID must be a single path component.")
     if isolation not in VALID_ISOLATIONS:
@@ -1207,7 +1221,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
 def codex_tasks(state: dict[str, Any]) -> dict[str, Any]:
     """Return only Codex records, including older records without a backend field."""
     return {tid: task for tid, task in state["tasks"].items()
-            if isinstance(task, dict) and task.get("backend", "codex") in VALID_BACKENDS}
+            if isinstance(task, dict) and task.get("backend", SUPPORTED_BACKEND) in _COMPAT_BACKENDS}
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -1228,7 +1242,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         with locked_state() as state:
             task_record = next((t for t in state["tasks"].values()
                                 if isinstance(t, dict) and t.get("session_id") == session_id), None)
-            if task_record and task_record.get("backend", "codex") not in VALID_BACKENDS:
+            if task_record and task_record.get("backend", SUPPORTED_BACKEND) not in _COMPAT_BACKENDS:
                 raise ValueError("The saved session does not belong to Codex.")
     original = task_record or {}
     backend = "codex"
@@ -1569,7 +1583,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument("--cwd", default=".", help="Target repository or working directory.")
     p_run.add_argument("--prompt", required=True, help="Task prompt or '-' for stdin.")
-    p_run.add_argument("--backend", choices=VALID_BACKENDS, default="codex")
+    p_run.add_argument("--backend", type=parse_backend_arg, default=SUPPORTED_BACKEND, help=argparse.SUPPRESS)
     p_run.add_argument("--difficulty", choices=VALID_DIFFICULTIES, default="auto")
     p_run.add_argument("--quality", choices=VALID_QUALITIES, default="smart", help="Quality/quota routing mode (default: smart).")
     p_run.add_argument("--prefer-wide", action="store_true", help="Prefer largest-context frontier sibling for wide repo sweeps.")
@@ -1586,7 +1600,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--dry-run", action="store_true")
 
     p_batch = sub.add_parser("batch", help="Dispatch parallel independent tasks from a JSON manifest.")
-    p_batch.add_argument("--backend", choices=VALID_BACKENDS, default="codex")
+    p_batch.add_argument("--backend", type=parse_backend_arg, default=SUPPORTED_BACKEND, help=argparse.SUPPRESS)
     p_batch.add_argument("--manifest", required=True, help="Path to JSON list or {tasks:[...]} file.")
     p_batch.add_argument("--cwd", default=None, help="Default cwd when task item omits cwd.")
     p_batch.add_argument("--quality", choices=VALID_QUALITIES, default="smart")
@@ -1599,7 +1613,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_res.add_argument("--task-id", default=None)
     p_res.add_argument("--session-id", default=None)
     p_res.add_argument("--cwd", default=None)
-    p_res.add_argument("--backend", choices=VALID_BACKENDS, default="codex")
+    p_res.add_argument("--backend", type=parse_backend_arg, default=SUPPORTED_BACKEND, help=argparse.SUPPRESS)
     p_res.add_argument("--prompt", required=True, help="Follow-up prompt or '-' for stdin.")
     p_res.add_argument("--difficulty", choices=VALID_DIFFICULTIES, default="auto")
     p_res.add_argument("--quality", choices=VALID_QUALITIES, default="smart")
@@ -1617,7 +1631,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rev = sub.add_parser("review", help="Run non-interactive read-only Codex code review.")
     p_rev.add_argument("--task-id", default=None)
     p_rev.add_argument("--cwd", default=None)
-    p_rev.add_argument("--backend", choices=VALID_BACKENDS, default="codex")
+    p_rev.add_argument("--backend", type=parse_backend_arg, default=SUPPORTED_BACKEND, help=argparse.SUPPRESS)
     p_rev.add_argument("--quality", choices=VALID_QUALITIES, default="smart")
     p_rev.add_argument("--model", type=validate_model, default=None)
     p_rev.add_argument("--effort", choices=VALID_EFFORTS, default=None)

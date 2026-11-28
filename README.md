@@ -9,7 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Koala973/antigravity-lead-codex/releases"><img src="https://img.shields.io/badge/release-v1.0.2-7c3aed.svg" alt="Release v1.0.2"/></a>
+  <a href="https://github.com/Koala973/antigravity-lead-codex/actions/workflows/ci.yml"><img src="https://github.com/Koala973/antigravity-lead-codex/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
+  <a href="https://github.com/Koala973/antigravity-lead-codex/releases"><img src="https://img.shields.io/badge/release-v2.0.0-7c3aed.svg" alt="Release v2.0.0"/></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"/></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20(WSL2)-lightgrey.svg" alt="Platform"/>
   <img src="https://img.shields.io/badge/node-%3E%3D22.5-339933.svg" alt="Node 22.5+"/>
@@ -133,21 +134,21 @@ curl -fsSL https://raw.githubusercontent.com/Koala973/antigravity-lead-codex/mai
 | :--- | :--- |
 | `--all` | 默认模式，安装全部 3 个模块 |
 | `--console-only` | 仅安装 `codex-console` 侧栏插件 |
-| `--ref <tag\|branch>` | 指定安装特定版本或分支（如 `--ref v1.0.0`） |
-| `--no-build` | 直接复用预构建的 `dist/app.html`，仅安装运行时依赖 |
+| `--ref <tag\|branch>` | 指定安装特定版本或分支（如 `--ref v2.0.0`） |
+| `--no-build` | 复用预构建的 `dist/app.html`，跳过 Vite UI 构建，仅执行 `npm ci --omit=dev` 安装生产期 Node 依赖（仍需访问 npm） |
 | `--uninstall` | 卸载已安装的插件与技能（保留用户 SQLite 数据不丢失） |
 
-### 方式二：下载 GitHub Release 离线包
+### 方式二：下载 GitHub Release 预构建 UI 包
 
-从 [Releases](https://github.com/Koala973/antigravity-lead-codex/releases) 下载 `antigravity-lead-codex-vX.Y.Z.tar.gz` 与 `SHA256SUMS.txt`：
+从 [Releases](https://github.com/Koala973/antigravity-lead-codex/releases) 下载 `antigravity-lead-codex-vX.Y.Z.tar.gz` 与 `SHA256SUMS.txt`（该归档已内置预构建 `dist/app.html`，可跳过 Vite 与开发依赖，但非无网离线包，`install.sh --no-build` 仍需通过 npm 安装 `@modelcontextprotocol/sdk` 与 `zod` 两个生产期依赖）：
 
 ```bash
 # 1. 校验完整性
 shasum -a 256 -c SHA256SUMS.txt
 
-# 2. 解压并本地安装（自动复用包内预构建的 dist/app.html）
-tar -xzf antigravity-lead-codex-v1.0.0.tar.gz
-cd antigravity-lead-codex-v1.0.0
+# 2. 解压并本地安装（自动复用包内预构建的 dist/app.html，仅安装 prod 依赖）
+tar -xzf antigravity-lead-codex-v2.0.0.tar.gz
+cd antigravity-lead-codex-v2.0.0
 bash scripts/install.sh --no-build
 ```
 
@@ -170,7 +171,7 @@ bash scripts/install.sh
 bash scripts/doctor.sh
 ```
 
-`doctor.sh` 会逐项检查 Node `>=22.5`（含 `node:sqlite`）、Python、Git、Codex CLI、`~/.codex/state_5.sqlite` 可读性、插件完整性，并执行真实 MCP stdio `initialize` 握手测试。常见排障见 [docs/DOCTOR.md](docs/DOCTOR.md)。
+`doctor.sh` 会逐项检查 Node `>=22.5`（含 `node:sqlite`）、Python、Git、Codex CLI、`~/.codex/state_5.sqlite` 可读性、插件完整性，并执行真实 MCP stdio `initialize` + `tools/list` + `resources/read` 握手测试。常见排障见 [docs/DOCTOR.md](docs/DOCTOR.md)。
 
 ---
 
@@ -178,6 +179,9 @@ bash scripts/doctor.sh
 
 ```text
 antigravity-lead-codex/
+├── .github/
+│   ├── workflows/                     # GitHub Actions CI & Release 自动化工作流
+│   └── ISSUE_TEMPLATE/                # Bug Report / Feature Request 与 PR 模板
 ├── plugins/
 │   ├── codex-console/                 # Antigravity 侧栏 MCP App 控制台插件
 │   │   ├── bin/run-server.sh          # 跨环境 Node 22+ 自动探测启动器（无硬编码路径）
@@ -192,10 +196,12 @@ antigravity-lead-codex/
 ├── scripts/
 │   ├── install.sh                     # 一键在线 / 本地安装与卸载脚本
 │   ├── doctor.sh                      # 环境体检与 MCP 握手自测脚本
-│   ├── package-release.sh             # 可复现 Release 打包与 SHA256 生成脚本
-│   └── privacy-check.sh               # 隐私与硬编码路径 CI 拦截脚本
-├── tests/                             # 合成 SQLite MCP 集成测试 + Python 单元测试
-├── docs/                              # 架构说明、排障指南与 CI/Release 工作流模板
+│   ├── verify-mcp-handshake.mjs       # 真实 MCP stdio initialize / tools/list / resources/read 校验
+│   ├── check-version.mjs              # 全仓单一版本号一致性门禁脚本
+│   ├── package-release.sh             # 可复现预构建 UI Release 打包与 SHA256 生成脚本
+│   └── privacy-check.sh               # 隐私、硬编码路径与 Secret/Token 防泄漏扫描脚本
+├── tests/                             # 合成 SQLite MCP 集成测试、Python 单元测试与工程守卫测试
+├── docs/                              # 架构说明、能力矩阵、排障指南与 v2.0 升级规格
 ```
 
 ---

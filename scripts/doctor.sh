@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Antigravity-Lead-Codex Doctor: environment check & MCP stdio smoke test
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GEMINI_CONFIG_DIR="${GEMINI_CONFIG_DIR:-$HOME/.gemini/config}"
 CONSOLE_DIR="$GEMINI_CONFIG_DIR/plugins/codex-console"
 ROUTER_DIR="$GEMINI_CONFIG_DIR/plugins/codex-auto-router"
@@ -37,11 +38,13 @@ fi
 
 # 2. Check Python 3.10+ & Git
 if command -v python3 >/dev/null 2>&1; then
-  PY_VER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')"
-  if python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
+  PY_VER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")' 2>/dev/null || true)"
+  if [[ -n "$PY_VER" ]] && python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
     ok "Python: $PY_VER"
-  else
+  elif [[ -n "$PY_VER" ]]; then
     warn "Python $PY_VER < 3.10 (dispatch.py requires 3.10+)"
+  else
+    warn "python3 found in PATH but failed to execute (optional if using --console-only)"
   fi
 else
   warn "python3 not found (optional if using --console-only)"
@@ -87,32 +90,67 @@ else
   warn "multi-agent-dispatch not installed (OK if installed with --console-only)"
 fi
 
-# 5. Live MCP stdio handshake smoke test
+# 5. Live MCP stdio handshake smoke test (initialize + tools/list + resources/read)
 if [[ -n "$NODE_BIN" && -x "$CONSOLE_DIR/bin/run-server.sh" && -d "$CONSOLE_DIR/node_modules" ]]; then
   TMP_DATA="$(mktemp -d)"
   trap 'rm -rf "$TMP_DATA"' EXIT
-  if "$NODE_BIN" --no-warnings -e '
-    import { spawn } from "node:child_process";
-    const child = spawn("bash", [process.argv[1], "--data-dir", process.argv[2]], { stdio: ["pipe", "pipe", "pipe"] });
-    let buf = "";
-    const timer = setTimeout(() => { child.kill(); process.exit(1); }, 8000);
-    child.stdout.on("data", (d) => {
-      buf += d.toString("utf8");
-      if (buf.includes("\n")) {
-        const msg = JSON.parse(buf.split("\n")[0]);
-        clearTimeout(timer);
-        child.kill();
-        process.exit(msg?.result?.capabilities?.resources && msg?.result?.capabilities?.tools ? 0 : 1);
-      }
-    });
-    child.stdin.write(JSON.stringify({
-      jsonrpc: "2.0", id: 1, method: "initialize",
-      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "doctor", version: "1.0.0" } }
-    }) + "\n");
-  ' "$CONSOLE_DIR/bin/run-server.sh" "$TMP_DATA"; then
-    ok "MCP stdio handshake (initialize + tools/resources capabilities) passed"
+  EXPECTED_VER="$(cd "$CONSOLE_DIR" && "$NODE_BIN" -p "require('./package.json').version" 2>/dev/null || true)"
+  HANDSHAKE_OK=0
+  if [[ -f "$SCRIPT_DIR/verify-mcp-handshake.mjs" ]]; then
+    if [[ -n "$EXPECTED_VER" ]]; then
+      "$NODE_BIN" --no-warnings "$SCRIPT_DIR/verify-mcp-handshake.mjs" \
+        "$CONSOLE_DIR/bin/run-server.sh" --data-dir "$TMP_DATA" --expected-version "$EXPECTED_VER" >/dev/null 2>&1 && HANDSHAKE_OK=1
+    else
+      "$NODE_BIN" --no-warnings "$SCRIPT_DIR/verify-mcp-handshake.mjs" \
+        "$CONSOLE_DIR/bin/run-server.sh" --data-dir "$TMP_DATA" >/dev/null 2>&1 && HANDSHAKE_OK=1
+    fi
   else
-    fail "MCP stdio handshake failed"
+    "$NODE_BIN" --no-warnings -e '
+      import { spawn } from "node:child_process";
+      const child = spawn("bash", [process.argv[1], "--data-dir", process.argv[2]], { stdio: ["pipe", "pipe", "pipe"] });
+      const pending = new Map();
+      let buf = "", nextId = 1;
+      const rpc = (method, params = {}) => new Promise((resolve, reject) => {
+        const id = nextId++;
+        const timer = setTimeout(() => reject(new Error("timeout")), 8000);
+        pending.set(id, { resolve, reject, timer });
+        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      });
+      child.stdout.on("data", (d) => {
+        buf += d.toString("utf8");
+        let nl;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+          if (!line.trim()) continue;
+          const msg = JSON.parse(line);
+          const w = pending.get(msg.id);
+          if (!w) continue;
+          clearTimeout(w.timer); pending.delete(msg.id);
+          if (msg.error) w.reject(new Error(msg.error.message)); else w.resolve(msg.result);
+        }
+      });
+      (async () => {
+        const init = await rpc("initialize", {
+          protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "doctor", version: process.argv[3] || "2.0.0" }
+        });
+        if (!init?.capabilities?.tools || !init?.capabilities?.resources) process.exit(1);
+        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+        const listed = await rpc("tools/list");
+        const openTool = (listed?.tools || []).find(t => t.name === "open_codex_console");
+        const uri = openTool?._meta?.ui?.resourceUri;
+        if (!uri) process.exit(1);
+        const res = await rpc("resources/read", { uri });
+        const content = res?.contents?.[0];
+        if (content?.mimeType !== "text/html;profile=mcp-app" || !(content?.text?.length > 10000)) process.exit(1);
+        child.kill();
+        process.exit(0);
+      })().catch(() => { child.kill(); process.exit(1); });
+    ' "$CONSOLE_DIR/bin/run-server.sh" "$TMP_DATA" "$EXPECTED_VER" >/dev/null 2>&1 && HANDSHAKE_OK=1
+  fi
+  if [[ "$HANDSHAKE_OK" -eq 1 ]]; then
+    ok "MCP stdio handshake (initialize + tools/list + resources/read) passed"
+  else
+    fail "MCP stdio handshake (initialize + tools/list + resources/read) failed"
   fi
 fi
 

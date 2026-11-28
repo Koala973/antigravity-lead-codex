@@ -2,7 +2,7 @@
   "name": "codex-console",
   "displayName": "Antigravity Lead Codex",
   "description": "Antigravity 侧栏可视化控制台（Antigravity Lead Codex）：专注 Antigravity（Gemini 大脑）与本地 OpenAI Codex（执行之手）开箱即用互通，统一聚合本地 Codex CLI/Desktop 任务、隔离 Worktree 受管子代理、实时进度流、只读卡点诊断、排队唤醒、跨会话绑定与极简外观/像素猫切换。",
-  "version": "1.3.1",
+  "version": "2.0.0",
   "logo": "assets/logo.svg",
   "homepage": "https://github.com/Koala973/antigravity-lead-codex",
   "repository": "https://github.com/Koala973/antigravity-lead-codex",

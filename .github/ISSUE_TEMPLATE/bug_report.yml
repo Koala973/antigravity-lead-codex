@@ -1,0 +1,63 @@
+name: Bug Report
+description: Report a bug in codex-console, multi-agent-dispatch, or codex-auto-router
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue! Please run `bash scripts/doctor.sh` first and include the sanitized output below.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      options:
+        - codex-console (MCP App side pane)
+        - multi-agent-dispatch (dispatch.py)
+        - codex-auto-router (rules / hooks)
+        - Installer / Doctor / Release packaging
+        - Documentation / CI
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_mode
+    attributes:
+      label: Installation Mode
+      options:
+        - "--all (Full Suite)"
+        - "--console-only (Codex Console Only)"
+        - From source checkout
+        - GitHub Release prebuilt UI archive
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Node.js version, Python version, Codex CLI version, and Antigravity version
+      placeholder: |
+        - OS: macOS 15.x / Ubuntu 24.04 / WSL2
+        - Node.js: v22.x
+        - Python: 3.12.x
+        - Codex CLI: 0.17x.0
+        - Antigravity: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What Happened?
+      description: Clear description of the bug, expected behavior, and reproduction steps.
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor_output
+    attributes:
+      label: Doctor Output & Logs (Sanitized)
+      description: Paste output from `bash scripts/doctor.sh` or relevant stderr logs. Remove any personal paths or tokens.
+      render: shell

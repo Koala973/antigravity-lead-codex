@@ -2,6 +2,13 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DEFAULT_CLIENT_VERSION = JSON.parse(
+  fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8')
+).version;
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 const CACHE_TTL_MS = 60_000;
@@ -170,7 +177,7 @@ export function readQuotaFromRollouts(codexHome = CODEX_HOME) {
   };
 }
 
-export function fetchQuotaFromAppServer(codexBin, env, timeoutMs = 5500) {
+export function fetchQuotaFromAppServer(codexBin, env, timeoutMs = 5500, clientVersion = DEFAULT_CLIENT_VERSION) {
   return new Promise((resolve) => {
     if (!codexBin) return resolve(null);
     let settled = false;
@@ -244,7 +251,7 @@ export function fetchQuotaFromAppServer(codexBin, env, timeoutMs = 5500) {
           id: 1,
           method: 'initialize',
           params: {
-            clientInfo: { name: 'codex-console', version: '1.0.0' },
+            clientInfo: { name: 'codex-console', version: clientVersion },
             capabilities: {},
           },
         }) + '\n'
@@ -256,10 +263,11 @@ export function fetchQuotaFromAppServer(codexBin, env, timeoutMs = 5500) {
 }
 
 export class QuotaTracker {
-  constructor({ codexBin, env, codexHome = CODEX_HOME } = {}) {
+  constructor({ codexBin, env, codexHome = CODEX_HOME, clientVersion = DEFAULT_CLIENT_VERSION } = {}) {
     this.codexBin = codexBin;
     this.env = env;
     this.codexHome = codexHome;
+    this.clientVersion = clientVersion;
     this.cachedLive = null;
     this.lastLiveAttemptMs = 0;
     this.inFlight = null;
@@ -284,7 +292,7 @@ export class QuotaTracker {
   async refreshLive() {
     if (this.inFlight) return this.inFlight;
     this.lastLiveAttemptMs = Date.now();
-    this.inFlight = fetchQuotaFromAppServer(this.codexBin, this.env)
+    this.inFlight = fetchQuotaFromAppServer(this.codexBin, this.env, 5500, this.clientVersion)
       .then((res) => {
         if (res && res.available) {
           this.cachedLive = res;

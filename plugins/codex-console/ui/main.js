@@ -5,8 +5,9 @@ import {
 } from '@modelcontextprotocol/ext-apps';
 import { z } from 'zod';
 import { renderPixelCat } from './cat-pet.js';
+import { version as APP_VERSION } from '../package.json';
 
-const app = new App({ name: 'Antigravity Lead Codex', version: '1.3.1' }, {});
+const app = new App({ name: 'Antigravity Lead Codex', version: APP_VERSION }, {});
 const SLEEP_IDLE_MS = 12 * 60 * 1000;
 const TRACE_LABELS = new Map([
   ['reasoning', '思考'], ['commandExecution', '命令'], ['mcpToolCall', '工具'],

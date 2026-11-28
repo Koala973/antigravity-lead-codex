@@ -1,0 +1,39 @@
+name: Feature Request
+description: Propose an improvement for Antigravity-Lead-Codex
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - codex-console (UI / MCP Server)
+        - multi-agent-dispatch (Worktree Dispatcher)
+        - codex-auto-router (Rules & Hooks)
+        - Platform / Installer / Tooling
+        - Documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What workflow friction or missing capability in Antigravity <-> Codex CLI are you trying to solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe the behavior, UI, or CLI interface you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Optional workarounds or alternative designs you considered.

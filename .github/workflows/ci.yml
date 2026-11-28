@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Wave 2 adds windows-latest once bash/fcntl dependencies are removed.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node-version: "22"
+            python-version: "3.10"
+          - os: ubuntu-latest
+            node-version: "24"
+            python-version: "3.12"
+          - os: macos-latest
+            node-version: "22"
+            python-version: "3.10"
+          - os: macos-latest
+            node-version: "24"
+            python-version: "3.12"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Check Version Consistency
+        run: node scripts/check-version.mjs
+
+      - name: Privacy & Secret Scan
+        run: bash scripts/privacy-check.sh
+
+      - name: Syntax Check Shell, Python & JS Modules
+        run: |
+          bash -n scripts/install.sh
+          bash -n scripts/doctor.sh
+          bash -n scripts/package-release.sh
+          bash -n scripts/privacy-check.sh
+          bash -n plugins/codex-console/bin/run-server.sh
+          python3 -m py_compile skills/multi-agent-dispatch/scripts/dispatch.py
+          python3 -m py_compile plugins/codex-auto-router/hooks/allow_dispatch.py
+          for f in plugins/codex-console/server/*.mjs scripts/*.mjs tests/*.mjs; do
+            node --check "$f"
+          done
+
+      - name: Install & Build Codex Console UI
+        working-directory: plugins/codex-console
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build:ui
+
+      - name: Verify Built UI Bundle Matches Source
+        run: git diff --exit-code -- plugins/codex-console/dist/
+
+      - name: Run Wave 1 Hygiene & Guard Tests
+        run: node --no-warnings tests/test-wave1-guards.mjs
+
+      - name: Run MCP Server & Console Tests
+        run: node --no-warnings tests/test-mcp-console.mjs
+
+      - name: Run Dispatcher & Hook Unit Tests
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Verify Real Install, Doctor & MCP Stdio Handshake
+        run: |
+          set -euo pipefail
+          EXPECTED_VERSION="$(node -p "require('./plugins/codex-console/package.json').version")"
+          for mode in --all --console-only; do
+            TMP_CFG="$(mktemp -d)"
+            TMP_CODEX="$(mktemp -d)"
+            echo "=== Testing install.sh ${mode} --no-build --yes ==="
+            GEMINI_CONFIG_DIR="$TMP_CFG" CODEX_HOME="$TMP_CODEX" bash scripts/install.sh "$mode" --no-build --yes
+            GEMINI_CONFIG_DIR="$TMP_CFG" CODEX_HOME="$TMP_CODEX" bash scripts/doctor.sh
+            node --no-warnings scripts/verify-mcp-handshake.mjs \
+              "$TMP_CFG/plugins/codex-console/bin/run-server.sh" \
+              --expected-version "$EXPECTED_VERSION"
+            rm -rf "$TMP_CFG" "$TMP_CODEX"
+          done
+
+      - name: Smoke-Test Prebuilt UI Release Archive
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == '22'
+        run: |
+          set -euo pipefail
+          EXPECTED_VERSION="$(node -p "require('./plugins/codex-console/package.json').version")"
+          TAG="v${EXPECTED_VERSION}"
+          OUT_DIR="$(mktemp -d)"
+          EXTRACT_DIR="$(mktemp -d)"
+          TMP_CFG="$(mktemp -d)"
+          TMP_CODEX="$(mktemp -d)"
+          trap 'rm -rf "$OUT_DIR" "$EXTRACT_DIR" "$TMP_CFG" "$TMP_CODEX"' EXIT
+
+          bash scripts/package-release.sh "$TAG" "$OUT_DIR"
+          (cd "$OUT_DIR" && sha256sum -c SHA256SUMS.txt)
+          tar -xzf "$OUT_DIR/antigravity-lead-codex-${TAG}.tar.gz" -C "$EXTRACT_DIR"
+          UNPACKED="$EXTRACT_DIR/antigravity-lead-codex-${TAG}"
+
+          GEMINI_CONFIG_DIR="$TMP_CFG" CODEX_HOME="$TMP_CODEX" bash "$UNPACKED/scripts/install.sh" --no-build --yes
+          GEMINI_CONFIG_DIR="$TMP_CFG" CODEX_HOME="$TMP_CODEX" bash "$UNPACKED/scripts/doctor.sh"
+          node --no-warnings "$UNPACKED/scripts/verify-mcp-handshake.mjs" \
+            "$TMP_CFG/plugins/codex-console/bin/run-server.sh" \
+            --expected-version "$EXPECTED_VERSION"
